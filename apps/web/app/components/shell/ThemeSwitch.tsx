@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { IconMonitor, IconMoon, IconSun } from "../icons";
-import { resolvedTheme, setThemePreference, useThemePreference, type ThemePreference } from "../../lib/local-state";
+import { applyTheme, resolvedTheme, setThemePreference, useThemePreference, type ThemePreference } from "../../lib/local-state";
+import { reducedMotion } from "../../lib/motion";
 
 type Choice = "dark" | "system" | "light";
 
@@ -22,11 +23,13 @@ export function ThemeSwitch({ className = "" }: { className?: string }) {
     const nextPref: ThemePreference = key === "system" ? null : key;
     const apply = () => {
       setThemePreference(nextPref);
-      document.documentElement.setAttribute("data-theme", resolvedTheme(nextPref));
+      applyTheme(resolvedTheme(nextPref), nextPref === null);
     };
     const doc = document as Document & { startViewTransition?: (cb: () => void) => unknown };
-    if (doc.startViewTransition && !window.matchMedia("(prefers-reduced-motion: reduce)").matches) doc.startViewTransition(apply);
-    else apply();
+    if (doc.startViewTransition && !reducedMotion()) {
+      delete doc.documentElement.dataset.vt; // a cross-fade, not the last page change's slide (transitions.ts)
+      doc.startViewTransition(apply);
+    } else apply();
   };
 
   return (
@@ -44,7 +47,7 @@ export function ThemeSwitch({ className = "" }: { className?: string }) {
           aria-checked={current === o.key}
           title={o.label}
           onClick={() => choose(o.key)}
-          className={`relative z-10 flex items-center justify-center rounded-full transition-colors duration-150 ${current === o.key ? "text-ink" : "text-ink-4 hover:text-ink-2"}`}
+          className={`relative z-10 flex items-center justify-center rounded-full transition-colors duration-150 touch:before:absolute touch:before:inset-x-0 touch:before:top-1/2 touch:before:h-11 touch:before:-translate-y-1/2 touch:before:content-[''] ${current === o.key ? "text-ink" : "text-ink-4 hover:text-ink-2"}`}
         >
           {o.icon}
           <span className="sr-only">{o.label}</span>

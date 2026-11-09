@@ -1,5 +1,8 @@
 // Admin sign-in and the /api/admin guard. Public routes never read the session.
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import { ZodError } from "zod";
+import { safeReturn, SIGN_IN_HOME, type AdminMe } from "@aihot/contracts/admin";
+import { SITE } from "@aihot/site";
 import { config } from "@aihot/backend/config";
 import {
   completeLogin,
@@ -10,7 +13,6 @@ import {
   loginRedirect,
   parseCookies,
   passwordLogin,
-  safeReturn,
   SESSION_COOKIE,
   SESSION_DAYS,
   sessionPrincipal,
@@ -19,8 +21,13 @@ import {
 } from "@aihot/backend/admin/auth";
 import { sendProblem } from "../http/respond.ts";
 
-/** Cookies are Secure whenever the site is served over HTTPS. */
-const secure = () => config.siteUrl.startsWith("https://");
+/**
+ * A cookie is Secure when the request itself arrived over HTTPS: the browser judges it against the
+ * page's origin, so a plain-HTTP entry (a LAN address, a published container port) drops a Secure
+ * cookie at sign-in and the session never sticks. Behind a TLS-terminating proxy, trustProxy makes
+ * `req.protocol` reflect X-Forwarded-Proto, so the public HTTPS entry keeps its Secure cookie.
+ */
+const secure = (req: FastifyRequest) => req.protocol === "https";
 
 /**
  * Password attempts: at most 10 per client address and 50 in all per 15 minutes. The overall cap holds
@@ -56,6 +63,9 @@ export function adminHandler(fn: AdminHandler) {
     try {
       return await fn(req, reply, admin);
     } catch (error) {
+      if (error instanceof ZodError) {
+        return sendProblem(req, reply, { status: 400, code: "invalid_request", detail: error.issues.map((issue) => `${issue.path.join(".") || "请求"}: ${issue.message}`).join("; ").slice(0, 300) });
+      }
       if ((error as { statusCode?: number }).statusCode === 400 || error instanceof SyntaxError) {
         return sendProblem(req, reply, { status: 400, code: "invalid_request", detail: String((error as Error).message).slice(0, 300) });
       }
@@ -66,42 +76,59 @@ export function adminHandler(fn: AdminHandler) {
   };
 }
 
-export function registerAdminAuth(app: FastifyInstance) {
-  // The sign-in form posts as a plain HTML form.
-  app.addContentTypeParser("application/x-www-form-urlencoded", { parseAs: "string", bodyLimit: 16 * 1024 }, (_req, body, done) => {
-    done(null, Object.fromEntries(new URLSearchParams(String(body))));
-  });
+/** Feishu sign-in: the state cookie, then Feishu's authorization page. */
+function feishuRedirect(req: FastifyRequest, reply: FastifyReply, returnTo: string) {
+  const { url, stateCookie } = loginRedirect(returnTo);
+  reply.header("Set-Cookie", cookie(STATE_COOKIE, stateCookie, 600, secure(req))).header("Cache-Control", "no-store");
+  return reply.redirect(url, 302);
+}
 
-  // The web admin sends a signed-out visitor here with ?return=; the sign-in page lives in the web app.
+export function registerAdminAuth(app: FastifyInstance) {
+  // The web admin sends a signed-out visitor here with ?return=.
+  // With Feishu as the only way in, sign-in starts there at once; otherwise the sign-in page (in the web
+  // app) offers the ways in.
   app.get("/api/auth/login", async (req, reply) => {
-    const returnTo = String((req.query as Record<string, string>).return ?? "/admin");
+    const returnTo = String((req.query as Record<string, string>).return ?? SIGN_IN_HOME);
+    // A live session does not need signing in again: go straight to where the visitor was headed.
+    if (await sessionPrincipal(req.headers.cookie)) return reply.header("Cache-Control", "no-store").redirect(safeReturn(returnTo), 302);
+    if (feishuLoginConfigured() && !config.adminPassword) return feishuRedirect(req, reply, returnTo);
     return reply.header("Cache-Control", "no-store").redirect(loginPage(returnTo), 302);
   });
 
   app.get("/api/auth/options", async (_req, reply) => reply.header("Cache-Control", "no-store").send({ password: !!config.adminPassword, feishu: feishuLoginConfigured() }));
 
-  app.post("/api/auth/password", async (req, reply) => {
-    const b = (req.body ?? {}) as Record<string, string>;
-    const returnTo = String(b.return ?? "/admin");
-    reply.header("Cache-Control", "no-store");
-    if (tooManyAttempts(String(req.ip))) return reply.redirect(loginPage(returnTo, "too-many"), 303);
-    try {
-      const { token, returnTo: target } = await passwordLogin(String(b.password ?? ""), returnTo, req.headers["user-agent"]);
-      reply.header("Set-Cookie", cookie(SESSION_COOKIE, token, SESSION_DAYS * 86400, secure()));
-      return reply.redirect(target, 303);
-    } catch (error) {
-      if (!(error instanceof LoginRejected)) req.log.error({ err: error }, "admin login failed");
-      return reply.redirect(loginPage(returnTo, error instanceof LoginRejected && /ADMIN_PASSWORD/.test(error.message) ? "unset" : "wrong"), 303);
-    }
+  // The sign-in and sign-out forms post as plain HTML forms; only these routes read that format.
+  app.register(async (form) => {
+    form.addContentTypeParser("application/x-www-form-urlencoded", { parseAs: "string", bodyLimit: 16 * 1024 }, (_req, body, done) => {
+      done(null, Object.fromEntries(new URLSearchParams(String(body))));
+    });
+    form.post("/api/auth/password", async (req, reply) => {
+      const b = (req.body ?? {}) as Record<string, string>;
+      const returnTo = String(b.return ?? SIGN_IN_HOME);
+      reply.header("Cache-Control", "no-store");
+      if (tooManyAttempts(String(req.ip))) return reply.redirect(loginPage(returnTo, "too-many"), 303);
+      try {
+        const { token, returnTo: target } = await passwordLogin(String(b.password ?? ""), returnTo, req.headers["user-agent"]);
+        reply.header("Set-Cookie", cookie(SESSION_COOKIE, token, SESSION_DAYS * 86400, secure(req)));
+        return reply.redirect(target, 303);
+      } catch (error) {
+        if (!(error instanceof LoginRejected)) req.log.error({ err: error }, "admin login failed");
+        return reply.redirect(loginPage(returnTo, error instanceof LoginRejected && /ADMIN_PASSWORD/.test(error.message) ? "unset" : "wrong"), 303);
+      }
+    });
+    // Signing out is a plain form too: outside this scope its empty urlencoded body would be a 415.
+    form.post("/api/auth/logout", async (req, reply) => {
+      await endSession(req.headers.cookie);
+      reply.header("Set-Cookie", cookie(SESSION_COOKIE, "", 0, secure(req))).header("Cache-Control", "no-store");
+      return reply.redirect("/", 303);
+    });
   });
 
-  // Optional Feishu sign-in (FEISHU_LOGIN_APP_ID / FEISHU_LOGIN_APP_SECRET and an allowlist).
+  // Feishu sign-in (FEISHU_LOGIN_APP_ID / FEISHU_LOGIN_APP_SECRET and an allowlist), from the sign-in page.
   app.get("/api/auth/feishu", async (req, reply) => {
-    const returnTo = String((req.query as Record<string, string>).return ?? "/admin");
-    if (!feishuLoginConfigured()) return reply.redirect(loginPage(returnTo), 302);
-    const { url, stateCookie } = loginRedirect(returnTo);
-    reply.header("Set-Cookie", cookie(STATE_COOKIE, stateCookie, 600, secure())).header("Cache-Control", "no-store");
-    return reply.redirect(url, 302);
+    const returnTo = String((req.query as Record<string, string>).return ?? SIGN_IN_HOME);
+    if (!feishuLoginConfigured()) return reply.header("Cache-Control", "no-store").redirect(loginPage(returnTo), 302);
+    return feishuRedirect(req, reply, returnTo);
   });
 
   // The callback registered in the Feishu open platform: the state cookie comes back here.
@@ -110,28 +137,14 @@ export function registerAdminAuth(app: FastifyInstance) {
     reply.header("Cache-Control", "no-store");
     try {
       const { token, returnTo } = await completeLogin(String(q.code ?? ""), String(q.state ?? ""), parseCookies(req.headers.cookie)[STATE_COOKIE], req.headers["user-agent"]);
-      reply.header("Set-Cookie", [cookie(SESSION_COOKIE, token, SESSION_DAYS * 86400, secure()), cookie(STATE_COOKIE, "", 0, secure())]);
+      reply.header("Set-Cookie", [cookie(SESSION_COOKIE, token, SESSION_DAYS * 86400, secure(req)), cookie(STATE_COOKIE, "", 0, secure(req))]);
       return reply.redirect(returnTo, 302);
     } catch (error) {
       const message = error instanceof LoginRejected ? error.message : "登录失败，请稍后再试";
       if (!(error instanceof LoginRejected)) req.log.error({ err: error }, "admin login failed");
-      return reply.code(403).type("text/html; charset=utf-8").send(`<!doctype html><meta charset="utf-8"><title>登录失败</title><p style="font:16px system-ui;padding:40px">${message}。<a href="/admin/login">重新登录</a></p>`);
+      return reply.code(403).type("text/html; charset=utf-8").send(`<!doctype html><meta charset="utf-8"><title>登录失败 · ${SITE.name}</title><p style="font:16px system-ui;padding:40px">${message}。<a href="/api/auth/login">重新登录</a></p>`);
     }
   });
 
-  // For a reverse proxy that guards /admin itself (auth_request): 204 with a live session, else 401.
-  // Only the session cookie counts here, never the development stand-in.
-  app.get("/api/auth/check", async (req, reply) => {
-    reply.header("Cache-Control", "no-store");
-    const admin = await sessionPrincipal(req.headers.cookie);
-    return reply.code(admin && !admin.dev ? 204 : 401).send();
-  });
-
-  app.post("/api/auth/logout", async (req, reply) => {
-    await endSession(req.headers.cookie);
-    reply.header("Set-Cookie", cookie(SESSION_COOKIE, "", 0, secure())).header("Cache-Control", "no-store");
-    return reply.redirect("/", 303);
-  });
-
-  app.get("/api/admin/me", adminHandler(async (_req, _reply, admin) => ({ name: admin.name, csrf: admin.csrf, dev: admin.dev })));
+  app.get("/api/admin/me", adminHandler(async (_req, _reply, admin): Promise<AdminMe> => ({ name: admin.name, csrf: admin.csrf, dev: admin.dev })));
 }

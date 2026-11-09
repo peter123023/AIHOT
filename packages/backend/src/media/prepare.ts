@@ -1,51 +1,60 @@
-// Images of a newly selected item, prepared before readers arrive: every rendition its card and its
+// Images of a newly selected item, prepared as it is selected: every rendition its card and its
 // page ask the image proxy for is fetched and resized once (a first reader otherwise waits seconds
-// for the source site), animations are re-encoded, and after the release gate the share image is
-// rendered before the content push makes chat apps fetch it.
-import { convertAnimated, produceImage } from "./images.ts";
-import { loadItemDetail, siteItemDetail } from "../publication/detail.ts";
+// for the source site), animations are re-encoded, AVIF variants are made while the original is at
+// hand, and the share image is rendered before the content push makes chat apps fetch it.
+import { convertAnimated, convertAvif, produceImage } from "./images.ts";
+import { AVIF_MODES } from "./renditions.ts";
+import { AVIF_MODE_SUFFIX } from "@aihot/contracts/site";
+import { loadItemDetail } from "../publication/detail.ts";
 import { toFeedItemSummary } from "../publication/items.ts";
+import { loadItemOgCard } from "../publication/og.ts";
+import { renderOg } from "./og.ts";
+import { logError } from "../lib/log-error.ts";
 
-/** The (source, mode) pairs the proxy URLs in these public answers point at. */
+/** The (source, mode) pairs the proxy URLs in these public answers point at. AVIF variants are made from their rendition. */
 export function proxiedRenditions(answers: unknown[]): Array<{ url: string; mode: string }> {
   const text = JSON.stringify(answers).replaceAll("&amp;", "&").replaceAll("\\u0026", "&");
   const seen = new Map<string, { url: string; mode: string }>();
   for (const m of text.matchAll(/\/api\/img-proxy\?u=([^&"\s\\]+)&mode=([a-z0-9-]+)/g)) {
+    if (m[2]!.endsWith(AVIF_MODE_SUFFIX)) continue;
     const url = decodeURIComponent(m[1]!);
     seen.set(`${m[2]}|${url}`, { url, mode: m[2]! });
   }
   return [...seen.values()];
 }
 
-export async function prepareArticleMedia(articleId: string): Promise<{ renditions: number; failed: number; animatedSaved: number }> {
-  const found = await loadItemDetail(articleId);
-  if (found.kind !== "found") return { renditions: 0, failed: 0, animatedSaved: 0 };
+export async function prepareArticleMedia(articleId: string): Promise<{ renditions: number; failed: number; animatedSaved: number; avifSaved: number }> {
+  const [zh, original] = await Promise.all([loadItemDetail(articleId), loadItemDetail(articleId, "original")]);
+  if (zh.kind !== "found" || original.kind !== "found") return { renditions: 0, failed: 0, animatedSaved: 0, avifSaved: 0 };
   let failed = 0;
   let animatedSaved = 0;
-  const renditions = proxiedRenditions([toFeedItemSummary(found.row), siteItemDetail(found.detail), siteItemDetail(found.detail, true)]);
+  let avifSaved = 0;
+  const renditions = proxiedRenditions([toFeedItemSummary(zh.row), zh.item, original.item]);
   for (const { url, mode } of renditions) {
     try {
       const image = await produceImage(url, mode);
       if (image.type === "image/gif") animatedSaved += await convertAnimated(url, mode);
+      if ((AVIF_MODES as readonly string[]).includes(mode)) avifSaved += await convertAvif(url, mode);
     } catch {
       // The request path tries again (and answers 502) if the source is still unavailable.
       failed += 1;
     }
   }
-  return { renditions: renditions.length, failed, animatedSaved };
+  return { renditions: renditions.length, failed, animatedSaved, avifSaved };
 }
 
 /**
- * Renders the article's share image through the local router, so it sits in the api's disk cache
- * before chat apps unfurl the pushed link. Best effort.
+ * Renders the current public article card into the shared disk cache before chat apps unfurl the
+ * pushed link. No serving process is required. Best effort.
  */
 export async function warmShareImage(articleId: string): Promise<boolean> {
-  const base = process.env.LOCAL_ROUTER_URL || "http://127.0.0.1:3000";
   try {
-    const res = await fetch(`${base}/og/items/${encodeURIComponent(articleId)}.png`, { signal: AbortSignal.timeout(15_000) });
-    await res.arrayBuffer();
-    return res.ok;
-  } catch {
+    const card = await loadItemOgCard(articleId);
+    if (!card) return false;
+    await renderOg(card);
+    return true;
+  } catch (error) {
+    console.warn(JSON.stringify({ level: "warn", msg: "share image preparation failed", articleId, err: logError(error) }));
     return false;
   }
 }

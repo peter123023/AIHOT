@@ -1,7 +1,7 @@
 // Shared admin building blocks: page frame, cards, stats, badges, tables, buttons, fields and a
 // reason dialog (manual changes always carry a reason for the audit log).
 import { AnimatePresence, motion } from "motion/react";
-import { useEffect, useId, useRef, useState, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { Link, useSearchParams } from "react-router";
 import { ago, bj } from "./format";
 
@@ -20,16 +20,21 @@ export function AdminPage({ title, subtitle, actions, children }: { title: React
   );
 }
 
-export function Card({ title, right, children, className = "", pad = true }: { title?: ReactNode; right?: ReactNode; children: ReactNode; className?: string; pad?: boolean }) {
+/** Inside a scrollable card, tables scroll within it under a sticky header. */
+const InScrollCard = createContext(false);
+
+export function Card({ title, right, children, className = "", pad = true, scrollable = false }: { title?: ReactNode; right?: ReactNode; children: ReactNode; className?: string; pad?: boolean; scrollable?: boolean }) {
   return (
-    <section className={`rounded-panel bg-surface ring-1 ring-line ${className}`}>
+    <section className={`rounded-panel bg-surface ring-1 ring-line ${scrollable ? "flex max-h-120 min-h-0 min-w-0 flex-col" : ""} ${className}`}>
       {(title || right) && (
-        <div className="flex items-center justify-between gap-3 border-b border-line px-4 py-3">
+        <div className={`flex items-center justify-between gap-3 border-b border-line px-4 py-3 ${scrollable ? "shrink-0" : ""}`}>
           <h2 className="text-[14px] font-semibold text-ink">{title}</h2>
           {right && <div className="flex items-center gap-2 text-[12.5px] text-ink-3">{right}</div>}
         </div>
       )}
-      <div className={pad ? "p-4" : ""}>{children}</div>
+      <div className={`${pad ? "p-4" : ""} ${scrollable ? "flex min-h-0 flex-1 flex-col" : ""}`}>
+        <InScrollCard.Provider value={scrollable}>{children}</InScrollCard.Provider>
+      </div>
     </section>
   );
 }
@@ -95,14 +100,15 @@ export interface Column<T> {
 }
 
 export function DataTable<T>({ rows, columns, rowKey, empty = "暂无数据", onRowClick, dense }: { rows: T[]; columns: Column<T>[]; rowKey: (r: T) => string | number; empty?: ReactNode; onRowClick?: (r: T) => void; dense?: boolean }) {
+  const scrollable = useContext(InScrollCard);
   if (!rows.length) return <Empty>{empty}</Empty>;
   return (
-    <div className="overflow-x-auto">
+    <div className={scrollable ? "min-h-0 flex-1 overflow-auto" : "overflow-x-auto"} tabIndex={scrollable ? 0 : undefined}>
       <table className="w-full min-w-[640px] border-collapse text-left text-[13px]">
         <thead>
           <tr className="border-b border-line text-[12px] text-ink-3">
             {columns.map((c) => (
-              <th key={c.key} className={`whitespace-nowrap px-3 py-2 font-medium ${c.align === "right" ? "text-right" : ""} ${c.className ?? ""}`}>
+              <th key={c.key} className={`whitespace-nowrap px-3 py-2 font-medium ${scrollable ? "sticky top-0 z-10 bg-surface" : ""} ${c.align === "right" ? "text-right" : ""} ${c.className ?? ""}`}>
                 {c.label}
               </th>
             ))}
@@ -205,8 +211,8 @@ export function Select({ children, ...props }: React.ComponentProps<"select">) {
   );
 }
 
-/** Link-based filter chips bound to one query parameter. */
-export function FilterChips({ param, options }: { param: string; options: Array<{ value: string; label: ReactNode; count?: number }> }) {
+/** Link-based filter chips bound to one query parameter; `resets` names the filters that depend on it. */
+export function FilterChips({ param, options, resets = [] }: { param: string; options: Array<{ value: string; label: ReactNode; count?: number }>; resets?: string[] }) {
   const [sp] = useSearchParams();
   const current = sp.get(param) ?? "";
   return (
@@ -215,7 +221,7 @@ export function FilterChips({ param, options }: { param: string; options: Array<
         const next = new URLSearchParams(sp);
         if (o.value) next.set(param, o.value);
         else next.delete(param);
-        next.delete("page");
+        for (const name of ["page", ...resets]) next.delete(name);
         const active = current === o.value;
         return (
           <Link
@@ -263,7 +269,8 @@ export function Json({ value, collapsed = true, label = "原始数据" }: { valu
 
 /**
  * A modal that collects a reason (and optional extra fields) before a manual change. The submit
- * handler receives the reason; returning true closes the dialog.
+ * handler receives the reason (or the `fieldLabel` field's value); returning true closes the dialog.
+ * Without `requireReason` there is no text field.
  */
 export function ReasonDialog({
   open,
@@ -272,6 +279,7 @@ export function ReasonDialog({
   confirmLabel = "确认",
   danger,
   requireReason = true,
+  fieldLabel,
   children,
   onClose,
   onSubmit,
@@ -283,6 +291,8 @@ export function ReasonDialog({
   confirmLabel?: string;
   danger?: boolean;
   requireReason?: boolean;
+  /** Names the required field when it is not an audit reason, e.g. a credential's name. */
+  fieldLabel?: string;
   children?: ReactNode;
   onClose: () => void;
   onSubmit: (reason: string) => Promise<boolean | void> | boolean | void;
@@ -294,12 +304,13 @@ export function ReasonDialog({
     if (!open) return;
     setReason("");
     const t = setTimeout(() => ref.current?.focus(), 60);
+    return () => clearTimeout(t);
+  }, [open]);
+  useEffect(() => {
+    if (!open) return;
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
     window.addEventListener("keydown", onKey);
-    return () => {
-      clearTimeout(t);
-      window.removeEventListener("keydown", onKey);
-    };
+    return () => window.removeEventListener("keydown", onKey);
   }, [open, onClose]);
   return (
     <AnimatePresence>
@@ -324,11 +335,13 @@ export function ReasonDialog({
             <h2 className="text-[16px] font-semibold text-ink">{title}</h2>
             {description && <div className="mt-1.5 text-[13px] leading-relaxed text-ink-3">{description}</div>}
             {children && <div className="mt-4 space-y-3">{children}</div>}
-            <div className="mt-4">
-              <Field label={requireReason ? "原因（写进审计记录）" : "备注（可选）"}>
-                <Textarea ref={ref} value={reason} onChange={(e) => setReason(e.target.value)} placeholder={requireReason ? "为什么做这个改动" : ""} rows={2} />
-              </Field>
-            </div>
+            {requireReason && (
+              <div className="mt-4">
+                <Field label={fieldLabel ?? "原因（写进审计记录）"}>
+                  <Textarea ref={ref} value={reason} onChange={(e) => setReason(e.target.value)} placeholder={fieldLabel ? "" : "为什么做这个改动"} rows={2} />
+                </Field>
+              </div>
+            )}
             <div className="mt-5 flex justify-end gap-2">
               <Button tone="ghost" onClick={onClose}>取消</Button>
               <Button type="submit" tone={danger ? "danger" : "primary"} busy={busy} disabled={requireReason && !reason.trim()}>

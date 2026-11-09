@@ -1,31 +1,18 @@
-import { SITE } from "@aihot/industry/site";
+import { SITE } from "@aihot/site";
 import { useState, type ReactNode } from "react";
 import { Link } from "react-router";
 import { CATEGORY_KEYS, CATEGORY_LABELS } from "@aihot/contracts/taxonomy";
 import type { Route } from "./+types/content-item";
+import type { AdminContentChain, AdminPresentationRefresh } from "@aihot/contracts/admin";
 import { adminGet } from "../../lib/admin.server";
 import { useAdminAction } from "../../features/admin/action";
 import { bj, money } from "../../features/admin/format";
 import { KIND_LABEL, MODE_LABEL, VISIBILITY_LABEL } from "../../features/admin/labels";
 import { AdminPage, Badge, Button, Card, Empty, Field, Input, Json, KV, ReasonDialog, Select, Textarea } from "../../features/admin/ui";
 
-type Row = Record<string, any>;
-interface Chain {
-  article: Row;
-  discoveries: Row[];
-  revisions: Row[];
-  analyses: Row[];
-  publication: Row | null;
-  override: { fields: Record<string, unknown>; visibility: string | null; reason: string | null; version: number; updated_by: string; updated_at: string } | null;
-  ledger: Row[];
-  membership: Row[];
-  decisions: Row[];
-  deliveries: Row[];
-  history: Row[];
-}
 
 export async function loader({ request, params }: Route.LoaderArgs) {
-  return adminGet<Chain>(request, `/api/admin/content/${encodeURIComponent(params.id)}`);
+  return adminGet<AdminContentChain>(request, `/api/admin/content/${encodeURIComponent(params.id)}`);
 }
 
 export const meta: Route.MetaFunction = ({ loaderData }) => [{ title: `${loaderData?.publication?.title ?? loaderData?.article.title ?? "内容"} · ${SITE.name} 后台` }];
@@ -45,7 +32,7 @@ function Step({ title, meta, children, tone = "accent", last }: { title: ReactNo
   );
 }
 
-type Dialog = null | "visibility" | "seo" | "override" | "analyze" | "extract" | "group" | "detach" | "merge";
+type Dialog = null | "visibility" | "seo" | "override" | "analyze" | "extract" | "presentation" | "group" | "detach" | "merge";
 
 export default function ContentItem({ loaderData }: Route.ComponentProps) {
   const c = loaderData;
@@ -53,8 +40,9 @@ export default function ContentItem({ loaderData }: Route.ComponentProps) {
   const p = c.publication;
   const { run, pending } = useAdminAction();
   const [dialog, setDialog] = useState<Dialog>(null);
+  const [presentation, setPresentation] = useState<AdminPresentationRefresh | null>(null);
   const [visibility, setVisibility] = useState<string>(p?.visibility ?? "public");
-  const [fields, setFields] = useState({ title: "", summary: "", reason: "", category: "", tags: "", selected: "", silent: "" });
+  const [fields, setFields] = useState({ title: "", summary: "", reason: "", category: "", tags: "", scoreMode: "", score: "", selected: "", silent: "" });
   const [mergeInto, setMergeInto] = useState("");
   const version = c.override?.version ?? 0;
   const base = `/api/admin/content/${encodeURIComponent(a.id)}`;
@@ -69,6 +57,8 @@ export default function ContentItem({ loaderData }: Route.ComponentProps) {
       reason: String(f.reason ?? ""),
       category: String(f.category ?? ""),
       tags: Array.isArray(f.tags) ? (f.tags as string[]).join(", ") : "",
+      scoreMode: f.score === null ? "none" : typeof f.score === "number" ? "value" : "",
+      score: typeof f.score === "number" ? String(f.score) : "",
       selected: f.selected === undefined ? "" : String(f.selected),
       silent: f.silent === undefined ? "" : String(f.silent),
     });
@@ -98,6 +88,7 @@ export default function ContentItem({ loaderData }: Route.ComponentProps) {
           <Button onClick={() => setDialog("visibility")}>公开范围</Button>
           {p && <Button onClick={() => setDialog("seo")}>{p.indexable ? "取消收录" : "标记收录"}</Button>}
           <Button onClick={openOverride}>人工修正</Button>
+          <Button onClick={() => { setPresentation(null); setDialog("presentation"); }}>刷新正文展示</Button>
           <Button onClick={() => setDialog("analyze")}>重新评估</Button>
         </>
       }
@@ -165,10 +156,10 @@ export default function ContentItem({ loaderData }: Route.ComponentProps) {
                       </div>
                       {an.title_zh && <div className="mt-2 font-medium text-ink">{an.title_zh}</div>}
                       {an.reason_zh && <div className="mt-1 text-[12.5px] leading-relaxed text-ink-3">{an.reason_zh}</div>}
-                      {(an.receipts as Row[]).length > 0 && (
+                      {an.receipts.length > 0 && (
                         <div className="mt-2 flex flex-wrap gap-1.5 text-[11.5px]">
-                          {(an.receipts as Row[]).map((r) => (
-                            <span key={r.id} className="num rounded bg-surface px-1.5 py-0.5 text-ink-3 ring-1 ring-line">
+                          {an.receipts.map((r) => (
+                            <span key={r.id} className="num rounded-mark bg-surface px-1.5 py-0.5 text-ink-3 ring-1 ring-line">
                               回执 #{r.id} · {r.status} · {r.model ?? r.service}{r.cost !== null ? ` · ${money(r.cost)}` : ""}
                             </span>
                           ))}
@@ -343,7 +334,7 @@ export default function ContentItem({ loaderData }: Route.ComponentProps) {
       <ReasonDialog
         open={dialog === "override"}
         title="人工修正"
-        description="人工值优先于模型输出，之后的重处理不会覆盖；留空表示不修正该字段（清除已有修正请选“清除”）。"
+        description="人工值优先于模型输出，之后的重处理不会覆盖；留空的字段不修正，已有的修正留空即清除。"
         confirmLabel="保存修正"
         busy={pending === "override"}
         onClose={() => setDialog(null)}
@@ -358,6 +349,9 @@ export default function ContentItem({ loaderData }: Route.ComponentProps) {
           else if (c.override?.fields.category !== undefined) clear.push("category");
           if (fields.tags.trim()) next.tags = fields.tags.split(/[,，]/).map((t) => t.trim()).filter(Boolean);
           else if (c.override?.fields.tags !== undefined) clear.push("tags");
+          if (fields.scoreMode === "none") next.score = null;
+          else if (fields.scoreMode === "value") next.score = Number(fields.score);
+          else if (c.override?.fields.score !== undefined) clear.push("score");
           for (const k of ["selected", "silent"] as const) {
             if (fields[k] === "true" || fields[k] === "false") next[k] = fields[k] === "true";
             else if (c.override?.fields[k] !== undefined) clear.push(k);
@@ -376,6 +370,14 @@ export default function ContentItem({ loaderData }: Route.ComponentProps) {
             </Select>
           </Field>
           <Field label="标签（逗号分隔）"><Input value={fields.tags} onChange={(e) => setFields({ ...fields, tags: e.target.value })} /></Field>
+          <Field label="评分">
+            <Select value={fields.scoreMode} onChange={(e) => setFields({ ...fields, scoreMode: e.target.value })}>
+              <option value="">按模型</option>
+              <option value="none">撤销评分</option>
+              <option value="value">人工评分</option>
+            </Select>
+          </Field>
+          {fields.scoreMode === "value" && <Field label="分数（0–100）"><Input type="number" min={0} max={100} step="any" required value={fields.score} onChange={(e) => setFields({ ...fields, score: e.target.value })} /></Field>}
           <Field label="精选">
             <Select value={fields.selected} onChange={(e) => setFields({ ...fields, selected: e.target.value })}>
               <option value="">按模型</option>
@@ -403,6 +405,30 @@ export default function ContentItem({ loaderData }: Route.ComponentProps) {
         onClose={() => setDialog(null)}
         onSubmit={async () => (await run("POST", `${base}/rerun`, { step: "analyze" }, { label: "analyze", success: "已加入评估队列" })) !== null}
       />
+      <ReasonDialog
+        open={dialog === "presentation"}
+        title="刷新正文展示"
+        description="先检查原网页的图片、链接和排版变化。文字内容相同时保留现有摘要、译文、精选和事件归属。"
+        requireReason={false}
+        confirmLabel={presentation?.ready && presentation.changed ? "应用展示更新" : "预览变化"}
+        busy={pending === "presentation"}
+        onClose={() => setDialog(null)}
+        onSubmit={async () => {
+          const apply = presentation?.ready && presentation.changed;
+          const result = await run<AdminPresentationRefresh>("POST", `${base}/rerun`,
+            { step: "presentation", ...(apply ? { version: presentation.version } : { preview: true }) },
+            { label: "presentation", revalidate: !!apply, ...(apply ? { success: "正文展示已更新" } : {}) });
+          if (!result) { setPresentation(null); return false; }
+          setPresentation(result);
+          return result.applied;
+        }}
+      >
+        {presentation && <div className="space-y-2 text-[13px] text-ink-2">
+          <p>图片 {presentation.images.before} → {presentation.images.after}，链接 {presentation.links.before} → {presentation.links.after}。</p>
+          <p>{presentation.reason ?? (presentation.changed ? "可以应用本次展示更新。" : "当前正文展示无需更新。")}</p>
+          {presentation.translation === "reused" && <p>中文译文会保留原有文字，并同步图片和链接。</p>}
+        </div>}
+      </ReasonDialog>
       <ReasonDialog
         open={dialog === "extract"}
         title="重新抽取正文"

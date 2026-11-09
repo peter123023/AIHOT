@@ -1,7 +1,10 @@
+import { describePublicationTime } from "../sources/dates.ts";
 // The writing side of the analysis: the prefilter's and the content understanding's inputs, the
 // title/summary prompts for everything else, the output parsing and the deterministic guards. The
 // wording lives in the industry pack (industry/prompts/); a failed guard falls back without a repair call.
 import { IDENTITY_CONTEXT_ALIASES, IDENTITY_LEXICON, PUBLISHER_DOMAINS } from "@aihot/industry/taxonomy";
+import { stripTagMarkup, isChineseText as looksZh } from "../lib/text.ts";
+export { isChineseText as looksZh } from "../lib/text.ts";
 import { onlyXArticleLink } from "../sources/x.ts";
 import type { AnalyzeInputArticle } from "./input.ts";
 import { promptText } from "./prompts.ts";
@@ -13,18 +16,11 @@ export const UNDERSTAND_SYSTEM = promptText("understand");
 export const MAX_BODY_CHARS = 60_000;
 const capBody = (s: string) => (s.length > MAX_BODY_CHARS ? s.slice(0, MAX_BODY_CHARS) : s);
 
-// ── Text helpers ─────────────────────────────────────────────────────────────────────────────
+// Text helpers
 
 export function clampText(s: string, maxChars: number): string {
   const codepoints = Array.from(s);
   return codepoints.length <= maxChars ? s : codepoints.slice(0, maxChars).join("") + "…";
-}
-
-export function looksZh(s: string): boolean {
-  if (!/[一-鿿]/.test(s)) return false;
-  if (/[぀-ヿ]/.test(s)) return false; // Japanese kana
-  if (/[가-힯]/.test(s)) return false; // Hangul
-  return true;
 }
 
 /** Short tweet: under 100 characters of Chinese, under 500 of other text. */
@@ -37,9 +33,7 @@ export function isShortTweet(text: string): boolean {
 /** HTML, URLs (whose /2025/ paths models took for years) and entities out of article text. */
 export function cleanArticleTextForLLM(s: string): string {
   if (!s) return "";
-  return s
-    .replace(/<(script|style)[^>]*>[\s\S]*?<\/\1>/gi, " ")
-    .replace(/<[^>]+>/g, " ")
+  return stripTagMarkup(s.replace(/<(script|style)[^>]*>[\s\S]*?<\/\1>/gi, " "))
     .replace(/https?:\/\/\S+/gi, " ")
     .replace(/&nbsp;/gi, " ")
     .replace(/&amp;/gi, "&")
@@ -70,7 +64,7 @@ export function needsShortTweetTranslation(text: string): boolean {
   return englishRuns.some((run) => run.replace(/\s+/g, "").length >= 10);
 }
 
-// ── The material as the prefilter and the content understanding read it ─────────────────────
+// The material as the prefilter and the content understanding read it
 
 /** The post is an X Article's link whose article could not be fetched. */
 const unfetchedXArticle = (a: AnalyzeInputArticle) => !!a.xPost && a.bodyStatus !== "ok" && onlyXArticleLink(String(a.xPost.text ?? ""));
@@ -91,7 +85,7 @@ export function renderContext(a: AnalyzeInputArticle, opts: { annotateQuoted?: b
   const name = a.xPost?.authorName || a.author;
   const handle = a.xPost?.handle;
   if (name || handle) lines.push(`【作者】${[name, handle ? `@${handle}` : null].filter(Boolean).join(" · ")}`);
-  if (a.publishedAt) lines.push(`【发布时间】${a.publishedAt.toISOString()}`);
+  if (a.publishedAt) lines.push(`【发布时间】${describePublicationTime(a.publishedAt, a.publicationTime)}`);
   const media = (a.xPost?.media ?? a.media ?? []) as Array<{ kind?: string }>;
   const images = media.filter((m) => m.kind === "image").length;
   const videos = media.filter((m) => m.kind === "video").length;
@@ -120,7 +114,7 @@ export function renderContext(a: AnalyzeInputArticle, opts: { annotateQuoted?: b
 /** The prefilter's user message: the context as a JSON string (the prompt was tuned on this form). */
 export const prefilterUser = (a: AnalyzeInputArticle) => JSON.stringify(renderContext(a));
 
-/** Nothing to judge beyond the title: the prefilter's BLOCK then means "wait for material". */
+/** No text beyond the title: no body, feed excerpt, post or quoted text. */
 export function missingEvidence(a: AnalyzeInputArticle): boolean {
   return !a.bodyText?.trim() && !a.excerpt?.trim() && !String(a.xPost?.text ?? "").trim() && !String(a.xPost?.quoted?.text ?? "").trim();
 }
@@ -128,7 +122,7 @@ export function missingEvidence(a: AnalyzeInputArticle): boolean {
 export const understandUser = (a: AnalyzeInputArticle) =>
   ["请按系统规则理解以下单篇材料，一次返回全部六个字段。", renderContext(a, { annotateQuoted: true })].join("\n\n");
 
-// ── Identity context and guard ────────────────────────────────────────────────────────────────
+// Identity context and guard
 
 const lexiconName = (id: string) => IDENTITY_LEXICON.find((e) => e.id === id)?.name ?? null;
 
@@ -166,6 +160,7 @@ export interface TranslateInput {
   quotedText?: string;
   quotedAuthor?: string;
   publishedAt?: Date;
+  publicationTime?: string | null;
 }
 
 export function translateInputOf(a: AnalyzeInputArticle): TranslateInput {
@@ -182,6 +177,7 @@ export function translateInputOf(a: AnalyzeInputArticle): TranslateInput {
     quotedText: a.xPost?.quoted?.text ? String(a.xPost.quoted.text) : undefined,
     quotedAuthor: a.xPost?.quoted?.handle ? String(a.xPost.quoted.handle) : undefined,
     publishedAt: a.publishedAt ?? undefined,
+    publicationTime: a.publicationTime,
   };
 }
 
@@ -230,7 +226,7 @@ export function enforceIdentity(input: TranslateInput, copy: { titleZh: string; 
   };
 }
 
-// ── Answer-first summary length ──────────────────────────────────────────────────────────────
+// Answer-first summary length
 
 export function compactAnswerFirstSummary(summary: string, maxChars = 190): string {
   const text = summary.trim().replace(/\s*\n+\s*/g, " ");
@@ -242,16 +238,16 @@ export function compactAnswerFirstSummary(summary: string, maxChars = 190): stri
     result += sentence;
     if (result.length >= 80) break;
   }
-  if (result.length >= 50) return result.trim();
-  // The first sentence alone is too long: cut at a clause boundary, never inside a name or number.
-  const clauses = text.match(/[^，；：、,;:]+[，；：、,;:]?/gu) ?? [text];
-  result = "";
+  // Whole sentences, even a short one, read better than half of the next.
+  if (result) return result.trim();
+  // The first sentence alone is too long: cut at a clause boundary, never inside a name, number or enumeration.
+  const clauses = text.match(/[^，；,;]+[，；,;]?/gu) ?? [text];
   for (const clause of clauses) {
     if ((result + clause).length + 1 > maxChars) break;
     result += clause;
     if (result.length >= 80) break;
   }
-  return result.length >= 50 ? `${result.replace(/[，；：、,;:]$/u, "")}。` : text;
+  return result.length >= 50 ? `${result.replace(/[，；,;]$/u, "")}。` : text;
 }
 
 function answerFirstSummaryLengthOk(summary: string, input: TranslateInput): boolean {
@@ -271,7 +267,7 @@ export function finalizeCopy(input: TranslateInput, copy: { titleZh: string; sum
   return enforceIdentity(input, { titleZh: copy.titleZh, summaryZh });
 }
 
-// ── Title/summary prompts for items the content understanding does not write ─────────────────
+// Title/summary prompts for items the content understanding does not write
 
 const sourceName = (name?: string) => name?.trim() || "（未注明）";
 
@@ -282,7 +278,7 @@ function anchorDate(d: Date | undefined): string {
 
 export function buildArticlePrompt(input: TranslateInput): string {
   return promptText("summarize-article", {
-    publishedDate: anchorDate(input.publishedAt),
+    publishedDate: input.publicationTime?.length === 10 ? input.publicationTime : anchorDate(input.publishedAt),
     today: anchorDate(new Date()),
     sourceName: sourceName(input.sourceName),
     identity: identityPrompt(input),

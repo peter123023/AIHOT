@@ -1,88 +1,148 @@
-// Sitemap from the same public metadata as pages: reports, topics and their pages,
-// the latest 500 stories, leaderboard pages and indexable items. Cached ~5 minutes and rebuilt in the
-// background after that (crawlers get the previous copy meanwhile); if the database fails, the last
-// successful sitemap is served (never an empty one). Bounded.
-import { FEATURES } from "@aihot/industry/features";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+// Sitemap from the same public metadata as pages: /sitemap.xml is an index of one file per section, so
+// Search Console reports indexing section by section, plus a news section of the last 48 hours. Process
+// and HTTP caches share one five-minute deadline; a saved copy may bridge a restart only for the remainder
+// of that original lifetime.
+import { mkdir, readFile, stat, utimes, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { config } from "../config.ts";
+import { STORY_INDEX_MIN_REPORTS } from "@aihot/contracts/site";
+import { ABOUT, ACCESS, AGENT, POLICY, SITE } from "@aihot/site";
+import { config, REPO_ROOT } from "../config.ts";
+import { sha256, stableJson } from "../lib/ids.ts";
+import { loadChangelog } from "../site/meta.ts";
+import { latestHotRanking } from "./hot.ts";
+import { eventPageCondition, ITEM_FROM, thinPageCondition } from "./items.ts";
 import { sql } from "../db.ts";
-import { cached } from "../lib/cache.ts";
+import { shared } from "../lib/cache.ts";
 import { escapeXml } from "../lib/text.ts";
 import { siteUrl } from "./links.ts";
-import { leaderboardUrls } from "../leaderboard/read.ts";
+import { evidenceCondition, listedCondition, selectedCondition, storyReportCondition } from "./scope.ts";
+import { storyTexts } from "./story-text.ts";
 import { topicPageCounts } from "./topics.ts";
-
-async function leaderboardDetailUrls(): Promise<string[]> {
-  const fixed = new Set(["/leaderboard", "/leaderboard/sources", "/leaderboard/rules"]);
-  return (await leaderboardUrls()).filter((u) => !fixed.has(u) && !u.startsWith("/leaderboard/category/"));
-}
+import { serverModules, type SitemapEntry } from "../modules.ts";
 
 const MAX_URLS = 45_000;
 const TTL_MS = 5 * 60 * 1000;
-const CACHE_FILE = path.join(config.dataDir, "sitemap-last.xml");
+const CACHE_FILE = path.join(config.dataDir, "sitemap-last.json");
+const INDEX = "sitemap.xml";
+/** The news section's window: what appeared or changed this long ago or since. */
+const NEWS_WINDOW_MS = 48 * 60 * 60 * 1000;
+const NEWS = "news.xml";
 
-let lastGood: string | null = null;
+/** The index under `sitemap.xml`, each section under `<section>.xml`. */
+interface SitemapDocument { files: Record<string, string>; expiresAt: number }
 
-interface Entry {
-  loc: string;
-  lastmod?: Date | null;
-  changefreq?: string;
-  priority?: number;
+let lastGood: SitemapDocument | null = null;
+
+/** `newsAt`: the page's own date, which puts it in the news section while recent (and dates it there only). */
+type Entry = SitemapEntry & { section?: string; newsAt?: Date | null };
+
+/**
+ * One inventory for XML discovery and change notifications. A sitemap bounds what it advertises;
+ * notifications read the complete inventory, so leaving the sitemap is never a withdrawal.
+ * Collection pages have content identities, not invented modification dates: a removed member can
+ * change a page without leaving a reliable timestamp on its surviving members.
+ */
+export async function loadDiscoveryEntries(at = new Date(), limits?: { urls: number }): Promise<Entry[]> {
+  const entries: Entry[] = [];
+  const [activity] = limits ? [] : await sql<{ selected: string | null; listed: string | null }[]>`
+    SELECT md5(string_agg(p.article_id || ':' || p.revision::text, ',' ORDER BY p.timeline_at DESC, p.article_id)
+             FILTER (WHERE ${selectedCondition(at)})) AS selected,
+           md5(string_agg(p.article_id || ':' || p.revision::text, ',' ORDER BY p.timeline_at DESC, p.article_id)
+             FILTER (WHERE ${listedCondition(at)})) AS listed
+    FROM publications p WHERE ${listedCondition(at)}`;
+  const reports = await sql<{ kind: string; key: string; t: Date | null; changed: Date; revision: string }[]>`
+    SELECT r.kind, r.key,
+      CASE WHEN citations.revision IS NULL THEN greatest(r.updated_at, r.generated_at) END AS t,
+      greatest(r.updated_at, r.generated_at) AS changed,
+      md5(concat_ws('|', r.revision::text, r.updated_at::text, citations.revision)) AS revision
+    FROM reports r LEFT JOIN LATERAL (
+      SELECT md5(string_agg(p.article_id || ':' || p.revision::text || ':' || (${listedCondition(at)})::text,
+          ',' ORDER BY p.article_id)) AS revision
+      FROM publications p WHERE p.article_id IN (
+        SELECT value #>> '{}' FROM jsonb_path_query(r.content, '$.**.itemId') AS cited(value))
+    ) citations ON true ORDER BY r.kind, r.key DESC`;
+  const reportRevision = (kind: string) => sha256(stableJson(reports.filter((r) => r.kind === kind)));
+  const topics = await topicPageCounts(at, !limits);
+  entries.push(
+    { loc: "/", revision: activity?.selected ?? "", changefreq: "hourly", priority: 1 },
+    { loc: "/all", revision: activity?.listed ?? "", changefreq: "hourly", priority: 0.9 },
+    { loc: "/daily", revision: reportRevision("daily"), changefreq: "daily", priority: 0.9 },
+    { loc: "/hot", revision: limits ? undefined : sha256(stableJson((await latestHotRanking())?.entries ?? [])), changefreq: "hourly", priority: 0.9 },
+    { loc: "/daily/archive", revision: reportRevision("daily"), changefreq: "daily", priority: 0.7 },
+    { loc: "/weekly", revision: reportRevision("weekly"), changefreq: "weekly", priority: 0.7 },
+    { loc: "/monthly", revision: reportRevision("monthly"), changefreq: "monthly", priority: 0.6 },
+    { loc: "/topics", revision: sha256(stableJson(topics)), changefreq: "daily", priority: 0.7 },
+    { loc: "/agent", revision: sha256(stableJson([SITE, ACCESS, AGENT])), changefreq: "weekly", priority: 0.7 },
+    { loc: "/about", revision: sha256(stableJson(ABOUT)), changefreq: "monthly", priority: 0.5 },
+    { loc: "/terms", revision: sha256(stableJson([POLICY.terms, await readFile(path.join(REPO_ROOT, "site/pages/terms.md"), "utf8")])), changefreq: "monthly", priority: 0.4 },
+    { loc: "/privacy", revision: sha256(stableJson([POLICY.privacy, await readFile(path.join(REPO_ROOT, "site/pages/privacy.md"), "utf8")])), changefreq: "monthly", priority: 0.4 },
+    { loc: "/changelog", revision: sha256(stableJson(loadChangelog())), changefreq: "weekly", priority: 0.5 },
+  );
+  for (const r of reports) entries.push({ loc: `/${r.kind}/${r.key}`, lastmod: r.t, newsAt: r.changed, revision: r.revision, changefreq: "monthly", priority: 0.6 });
+  for (const t of topics) {
+    if (!t.indexable) continue;
+    entries.push({ loc: `/topics/${t.slug}`, revision: t.revision, changefreq: "daily", priority: 0.6 });
+    // A topic's archive pages are reached from the topic page, the one that stands for the topic in
+    // search: the sitemap leaves them out, notifications still say when they change.
+    if (!limits) for (let p = 2; p <= t.pages; p++) entries.push({ loc: `/topics/${t.slug}/page/${p}`, revision: t.revision });
+  }
+  // A story needs listed evidence of its own, and STORY_INDEX_MIN_REPORTS reports: with fewer its page is
+  // noindex everywhere, so neither the sitemap nor notifications list it. Its identity follows current
+  // readable reports as well as the digest, so a correction or regrouping is visible even when latest_at
+  // does not advance.
+  const stories = await sql<{ id: number; public_id: string; revision: string }[]>`
+    SELECT st.id, st.public_id::text, md5(concat_ws('|', st.title, st.summary, st.digest, st.digest_updated_at::text,
+      st.version::text, members.revision)) AS revision
+    FROM stories st JOIN LATERAL (
+      SELECT md5(string_agg(concat_ws(':', p.article_id, p.revision::text, fa.role, f.updated_at::text, s.name),
+        ',' ORDER BY p.article_id, f.id)) AS revision, count(DISTINCT p.article_id) AS reports
+      FROM facts f JOIN fact_articles fa ON fa.fact_id = f.id JOIN publications p ON p.article_id = fa.article_id
+      JOIN sources s ON s.id = p.source_id
+      WHERE f.story_id = st.id AND ${storyReportCondition(at)}
+    ) members ON true
+    WHERE st.merged_into IS NULL AND EXISTS (
+      SELECT 1 FROM facts f JOIN fact_articles fa ON fa.fact_id = f.id JOIN publications p ON p.article_id = fa.article_id
+      WHERE f.story_id = st.id AND ${evidenceCondition()} AND ${listedCondition(at)})
+      AND members.reports >= ${STORY_INDEX_MIN_REPORTS}
+    ORDER BY st.latest_at DESC NULLS LAST, st.id DESC`;
+  // Dated as the page's dateModified is (storyLd): its latest public report, or a newer digest that still stands.
+  // Only for the sitemap: notifications already follow the content's identity.
+  const texts = limits ? await storyTexts(stories.map((s) => Number(s.id)), at) : null;
+  for (const s of stories) {
+    const text = texts?.get(Number(s.id));
+    const dates = [text?.latest?.at, text?.digestUpdatedAt].filter((d): d is Date => !!d);
+    const lastmod = dates.length ? new Date(Math.max(...dates.map(Number))) : null;
+    entries.push({ loc: `/story/${s.public_id}`, lastmod, newsAt: lastmod, revision: s.revision, changefreq: "daily", priority: 0.5 });
+  }
+  for (const m of serverModules()) if (m.sitemap?.entries) entries.push(...(await m.sitemap.entries()).map((e) => ({ ...e, section: m.name })));
+  // Material/translation timestamps can also record a retry or a state repair. Hash the content;
+  // without a dedicated public modification clock, omitting lastmod is more accurate than guessing.
+  // A selection's release is the one date of its own, and it dates the page only in the news section.
+  // Thin pages, and articles whose event page stands for them, stay out of the sitemap but not out of
+  // notifications: other engines index them.
+  const items = await sql<{ id: string; revision: string; released: Date | null }[]>`
+    SELECT p.article_id AS id,
+      md5(concat_ws('|', p.revision::text, a.content_hash, a.cover::text, tr.title, tr.body_html, tr.body_text, tr.complete::text, qt.text_zh,
+        s.name, s.icon_url, st.public_id::text, st.title)) AS revision,
+      CASE WHEN p.selected THEN p.visible_after END AS released
+    ${ITEM_FROM}
+    WHERE ${storyReportCondition(at)} AND p.indexable ${limits ? sql`AND NOT ${thinPageCondition()} AND NOT ${eventPageCondition(at)}` : sql``}
+    ORDER BY p.timeline_at DESC, p.article_id DESC ${limits ? sql`LIMIT ${Math.max(0, limits.urls - entries.length)}` : sql``}`;
+  for (const it of items) entries.push({ loc: `/items/${it.id}`, newsAt: it.released, revision: it.revision, changefreq: "monthly", priority: 0.5 });
+  return limits ? entries.slice(0, limits.urls) : entries;
 }
 
-async function build(): Promise<string> {
-  const entries: Entry[] = [];
-  const [latestItem] = await sql<{ t: Date | null }[]>`SELECT max(timeline_at) AS t FROM publications WHERE visibility = 'public' AND selected`;
-  const [latestDaily] = await sql<{ key: string | null; t: Date | null }[]>`SELECT max(key) AS key, max(generated_at) AS t FROM reports WHERE kind = 'daily'`;
-  const now = latestItem?.t ?? new Date();
-  entries.push(
-    { loc: "/", lastmod: now, changefreq: "hourly", priority: 1 },
-    { loc: "/all", lastmod: now, changefreq: "hourly", priority: 0.9 },
-    { loc: "/daily", lastmod: latestDaily?.t, changefreq: "daily", priority: 0.9 },
-    { loc: "/hot", lastmod: now, changefreq: "hourly", priority: 0.9 },
-    { loc: "/daily/archive", lastmod: latestDaily?.t, changefreq: "daily", priority: 0.7 },
-    { loc: "/weekly", changefreq: "weekly", priority: 0.7 },
-    { loc: "/monthly", changefreq: "monthly", priority: 0.6 },
-    { loc: "/topics", changefreq: "daily", priority: 0.7 },
-    { loc: "/agent", lastmod: now, changefreq: "weekly", priority: 0.7 },
-    { loc: "/about", changefreq: "monthly", priority: 0.5 },
-    { loc: "/terms", changefreq: "monthly", priority: 0.4 },
-    { loc: "/privacy", changefreq: "monthly", priority: 0.4 },
-    { loc: "/changelog", lastmod: now, changefreq: "weekly", priority: 0.5 },
-  );
-  if (FEATURES.leaderboard) {
-    entries.push(
-      { loc: "/leaderboard", changefreq: "daily", priority: 0.8 },
-      { loc: "/leaderboard/sources", changefreq: "weekly", priority: 0.5 },
-      { loc: "/leaderboard/rules", changefreq: "monthly", priority: 0.4 },
-    );
-    for (const board of ["coding", "reasoning", "knowledge", "professional"]) entries.push({ loc: `/leaderboard/category/${board}`, changefreq: "daily", priority: 0.6 });
-  }
-  if (FEATURES.codexResetMonitor) entries.push({ loc: "/codex-reset", changefreq: "hourly", priority: 0.6 });
-  const reports = await sql<{ kind: string; key: string; generated_at: Date }[]>`SELECT kind, key, generated_at FROM reports ORDER BY kind, key DESC`;
-  for (const r of reports) entries.push({ loc: `/${r.kind}/${r.key}`, lastmod: r.generated_at, changefreq: r.kind === "daily" ? "never" : "monthly", priority: r.kind === "daily" ? 0.6 : 0.6 });
-  for (const t of await topicPageCounts()) {
-    if (!t.indexable) continue;
-    entries.push({ loc: `/topics/${t.slug}`, lastmod: t.latest, changefreq: "daily", priority: 0.6 });
-    for (let p = 2; p <= t.pages; p++) entries.push({ loc: `/topics/${t.slug}/page/${p}`, lastmod: t.latest, changefreq: "weekly", priority: 0.3 });
-  }
-  // Stories with reports of their own; pages that only gather reports grouped elsewhere (imported story
-  // levels, regrouped history) are reachable but not listed.
-  const stories = await sql<{ public_id: string; latest_at: Date | null }[]>`
-    SELECT public_id::text, latest_at FROM stories WHERE merged_into IS NULL AND EXISTS (
-      SELECT 1 FROM facts f JOIN fact_articles fa ON fa.fact_id = f.id JOIN publications p ON p.article_id = fa.article_id
-      WHERE f.story_id = stories.id AND fa.role IN ('primary', 'report') AND p.visibility = 'public' AND p.eligible)
-    ORDER BY latest_at DESC NULLS LAST LIMIT 500`;
-  for (const s of stories) entries.push({ loc: `/story/${s.public_id}`, lastmod: s.latest_at, changefreq: "daily", priority: 0.5 });
-  // Model pages exist only for models on a public top-30 board; source pages for every registered source.
-  if (FEATURES.leaderboard) for (const loc of await leaderboardDetailUrls()) entries.push({ loc, changefreq: "weekly", priority: 0.4 });
-  const items = await sql<{ id: string; t: Date }[]>`
-    SELECT article_id AS id, updated_at AS t FROM publications WHERE visibility = 'public' AND indexable ORDER BY timeline_at DESC LIMIT ${MAX_URLS - entries.length}`;
-  for (const it of items) entries.push({ loc: `/items/${it.id}`, lastmod: it.t, changefreq: "monthly", priority: 0.5 });
+function sectionOf(e: Entry): string {
+  if (e.section) return e.section;
+  if (e.loc.startsWith("/story/")) return "stories";
+  if (e.loc.startsWith("/items/")) return "items";
+  if (/^\/topics(\/|$)/.test(e.loc)) return "topics";
+  if (/^\/(daily|weekly|monthly)(\/|$)/.test(e.loc)) return "reports";
+  return "pages";
+}
 
+function urlset(entries: Entry[]): string {
   const body = entries
-    .slice(0, MAX_URLS)
     .map((e) => {
       const parts = [`<loc>${escapeXml(siteUrl(e.loc))}</loc>`];
       if (e.lastmod) parts.push(`<lastmod>${e.lastmod.toISOString()}</lastmod>`);
@@ -94,23 +154,44 @@ async function build(): Promise<string> {
   return `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${body}\n</urlset>\n`;
 }
 
-const sitemap = cached(refreshSitemap, { freshMs: TTL_MS, maxStaleMs: 60 * 60_000 });
-
-export function sitemapXml(): Promise<string> {
-  return sitemap.get();
+async function build(at: Date): Promise<Record<string, string>> {
+  const entries = await loadDiscoveryEntries(at, { urls: MAX_URLS });
+  // What is new, newest first, from the pages the other sections list: events by their latest report or
+  // digest, selections by their release, reports by their publication or correction. A report that cites
+  // articles is undated in its own section (a cited article can change it unannounced); here its own date
+  // only says that it is new. The file stays in the index when nothing is new.
+  const since = at.getTime() - NEWS_WINDOW_MS;
+  const news = entries.flatMap((e) => (e.newsAt && e.newsAt.getTime() >= since ? [{ ...e, lastmod: e.newsAt }] : []))
+    .sort((a, b) => b.lastmod.getTime() - a.lastmod.getTime());
+  const files: Record<string, string> = { [NEWS]: urlset(news) };
+  for (const [section, list] of Map.groupBy(entries, sectionOf)) files[`${section}.xml`] = urlset(list);
+  const body = Object.keys(files).map((file) => `<sitemap>\n<loc>${escapeXml(siteUrl(`/sitemaps/${file}`))}</loc>\n</sitemap>`).join("\n");
+  files[INDEX] = `<?xml version="1.0" encoding="UTF-8"?>\n<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${body}\n</sitemapindex>\n`;
+  return files;
 }
 
-async function refreshSitemap(): Promise<string> {
+const rebuilding = shared<void, SitemapDocument>(() => "sitemap", refreshSitemap);
+
+export function loadSitemap(): Promise<SitemapDocument> {
+  if (lastGood && lastGood.expiresAt > Date.now()) return Promise.resolve(lastGood);
+  return rebuilding();
+}
+
+async function refreshSitemap(): Promise<SitemapDocument> {
   try {
-    const xml = await build();
-    lastGood = xml;
+    const at = Date.now();
+    const files = await build(new Date(at));
+    lastGood = { files, expiresAt: at + TTL_MS };
     await mkdir(path.dirname(CACHE_FILE), { recursive: true });
-    await writeFile(CACHE_FILE, xml).catch(() => {});
-    return xml;
+    // The file's timestamp preserves the same deadline when another process loads it after restart.
+    await writeFile(CACHE_FILE, JSON.stringify(files)).then(() => utimes(CACHE_FILE, new Date(at), new Date(at))).catch(() => {});
+    return lastGood;
   } catch (error) {
-    if (lastGood) return lastGood;
-    const last = await readFile(CACHE_FILE, "utf8").catch(() => null);
-    if (last) return last;
+    if (lastGood && lastGood.expiresAt > Date.now()) return lastGood;
+    const saved = await Promise.all([readFile(CACHE_FILE, "utf8"), stat(CACHE_FILE)]).catch(() => null);
+    if (saved && saved[1].mtimeMs + TTL_MS > Date.now()) {
+      return (lastGood = { files: JSON.parse(saved[0]) as Record<string, string>, expiresAt: saved[1].mtimeMs + TTL_MS });
+    }
     throw error;
   }
 }

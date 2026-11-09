@@ -1,10 +1,16 @@
-// X accounts via SocialData search ("from:handle -filter:replies", newest first). Plain account queries
-// are read together, about two dozen accounts per search (planXShards); SocialData bills per request.
-import { searchTweets, tweetMedia, tweetText, type SdArticle, type SdTweet } from "../providers/socialdata.ts";
+// X accounts via SocialData search, newest first. Verified publishers include their own thread
+// continuations; other replies stay excluded. Plain accounts share length-bounded search shards.
+import { marked } from "marked";
+import { searchTweets, tweetMedia, tweetText, type SdArticle, type SdArticleImage, type SdTweet } from "../providers/socialdata.ts";
+import { shownAddress } from "@aihot/contracts/addresses";
+import { escHtml, sanitizeBody } from "../content/sanitize.ts";
+import { X_ARTICLE_LINK } from "../content/posts.ts";
 import { ProviderRejectedError } from "../providers/receipts.ts";
 import type { XPostData } from "../content/materials.ts";
 import { sha256 } from "../lib/ids.ts";
+import { isXVideoUrl } from "../lib/video-url.ts";
 import { FetchError, type Candidate, type SourceRow } from "./types.ts";
+import { xHandle } from "./account.ts";
 
 function avatar(url: string | undefined): string | null {
   // Larger avatar than the default 48px thumbnail.
@@ -28,7 +34,6 @@ export function toXPost(t: SdTweet): XPostData {
   };
 }
 
-const X_ARTICLE_LINK = /https?:\/\/(?:www\.)?(?:x|twitter)\.com\/i\/article\/\d+/gi;
 
 /** The post links an X Article (long-form text posted on X): its body is fetched before judging. */
 export function linksXArticle(text: string | null | undefined): boolean {
@@ -40,8 +45,11 @@ export function onlyXArticleLink(text: string | null | undefined): boolean {
   return linksXArticle(text) && (text ?? "").replace(X_ARTICLE_LINK, "").trim().length < 30;
 }
 
-/** An X Article as plain text with Markdown-like headings, quotes and list marks; media blocks are left out. */
-export function xArticleText(article: SdArticle): { title: string; text: string } | null {
+/**
+ * An X Article as plain text with Markdown-like headings, quotes and list marks, for judging and writing
+ * (media blocks are left out), and as the page shows it (`html`, xArticleHtml).
+ */
+export function xArticleText(article: SdArticle, postUrl: string): { title: string; text: string; html: string | null } | null {
   const lines: string[] = [];
   for (const b of article.content_state?.blocks ?? []) {
     const text = (b.text ?? "").trim();
@@ -50,7 +58,115 @@ export function xArticleText(article: SdArticle): { title: string; text: string 
     lines.push(mark + text);
   }
   const text = lines.join("\n\n").trim();
-  return text ? { title: (article.title ?? "").trim(), text } : null;
+  return text ? { title: (article.title ?? "").trim(), text, html: xArticleHtml(article, postUrl) } : null;
+}
+
+type ArticleBlock = NonNullable<NonNullable<SdArticle["content_state"]>["blocks"]>[number];
+type ArticleEntity = { type?: string; data?: any };
+
+const STYLE_TAGS: Record<string, string> = { Bold: "strong", Italic: "em", Strikethrough: "del" };
+const HEADING_TAGS: Record<string, string> = { "header-one": "h2", "header-two": "h3", "header-three": "h4" };
+
+/** A block's words with its bold, italic and struck-through ranges and its links (ranges count characters). */
+function articleInline(block: ArticleBlock, entities: Map<string, ArticleEntity>): string {
+  const chars = Array.from(block.text ?? "");
+  const marks = chars.map(() => ({ tags: [] as string[], href: null as string | null }));
+  for (const r of block.inlineStyleRanges ?? []) {
+    const tag = STYLE_TAGS[r.style ?? ""];
+    for (let i = Math.max(0, r.offset); tag && i < Math.min(chars.length, r.offset + r.length); i++) if (!marks[i]!.tags.includes(tag)) marks[i]!.tags.push(tag);
+  }
+  for (const r of block.entityRanges ?? []) {
+    const entity = entities.get(String(r.key));
+    const url = entity?.type === "LINK" ? entity.data?.url : null;
+    if (typeof url !== "string" || !/^https?:\/\//i.test(url)) continue;
+    for (let i = Math.max(0, r.offset); i < Math.min(chars.length, r.offset + r.length); i++) marks[i]!.href = url;
+  }
+  const styled = (from: number, to: number) => {
+    let out = "";
+    for (let i = from; i < to;) {
+      const key = [...marks[i]!.tags].sort().join();
+      let j = i + 1;
+      while (j < to && [...marks[j]!.tags].sort().join() === key) j++;
+      let text = escHtml(chars.slice(i, j).join("")).replace(/\n/g, "<br>");
+      for (const tag of ["del", "em", "strong"]) if (marks[i]!.tags.includes(tag)) text = `<${tag}>${text}</${tag}>`;
+      out += text;
+      i = j;
+    }
+    return out;
+  };
+  let html = "";
+  for (let i = 0; i < chars.length;) {
+    let j = i + 1;
+    while (j < chars.length && marks[j]!.href === marks[i]!.href) j++;
+    html += marks[i]!.href ? `<a href="${escHtml(marks[i]!.href!)}">${styled(i, j)}</a>` : styled(i, j);
+    i = j;
+  }
+  return html;
+}
+
+/**
+ * An X Article as its page shows it, from the blocks X sent: the cover, headings, paragraphs with their
+ * emphasis and links, lists, quotes, pictures, dividers, tables and code (MARKDOWN blocks), and embedded
+ * posts as links. Inline videos keep a playable X rendition when supplied, with the original post as a fallback.
+ */
+export function xArticleHtml(article: SdArticle, postUrl: string): string | null {
+  const blocks = article.content_state?.blocks ?? [];
+  const map = article.content_state?.entityMap ?? [];
+  const entities = new Map<string, ArticleEntity>(Array.isArray(map) ? map.map((e) => [String(e.key), e.value]) : Object.entries(map));
+  const media = new Map((article.media_entities ?? []).map((m) => [String(m.media_id), m.media_info]));
+  const size = (image: SdArticleImage | undefined) => image?.original_img_width && image.original_img_height
+    ? ` width="${image.original_img_width}" height="${image.original_img_height}"` : "";
+  const picture = (image: SdArticleImage | undefined) => image?.original_img_url
+    ? `<img src="${escHtml(image.original_img_url)}"${size(image)} alt="">` : "";
+  const original = escHtml(postUrl);
+  const parts: string[] = [];
+  if (article.cover_url) parts.push(`<figure>${picture({ original_img_url: article.cover_url })}</figure>`);
+  for (let i = 0; i < blocks.length; i++) {
+    const block = blocks[i]!;
+    const type = block.type ?? "unstyled";
+    if (type === "unordered-list-item" || type === "ordered-list-item") {
+      const items: string[] = [];
+      for (; i < blocks.length && blocks[i]!.type === type; i++) if ((blocks[i]!.text ?? "").trim()) items.push(`<li>${articleInline(blocks[i]!, entities)}</li>`);
+      i--;
+      const tag = type === "ordered-list-item" ? "ol" : "ul";
+      if (items.length) parts.push(`<${tag}>${items.join("")}</${tag}>`);
+    } else if (type === "atomic") {
+      for (const range of block.entityRanges ?? []) {
+        const entity = entities.get(String(range.key));
+        if (entity?.type === "MEDIA") {
+          for (const item of entity.data?.mediaItems ?? []) {
+            const info = media.get(String(item?.mediaId));
+            if (info?.original_img_url) {
+              parts.push(`<figure>${picture(info)}</figure>`);
+            } else if (info?.preview_image || info?.variants?.length) {
+              // The 832 kb/s rendition of the reported demos was 724px wide, close to the reading column.
+              const mp4 = (info.variants ?? []).filter((v) => v.content_type === "video/mp4" && typeof v.url === "string" && isXVideoUrl(v.url))
+                .sort((a, b) => (a.bit_rate ?? 0) - (b.bit_rate ?? 0));
+              const src = (mp4.findLast((v) => (v.bit_rate ?? 0) <= 832_000) ?? mp4[0])?.url;
+              const preview = info.preview_image;
+              const poster = preview?.original_img_url ? ` poster="${escHtml(preview.original_img_url)}"` : "";
+              const label = "在 X 查看原视频";
+              parts.push(src
+                ? `<figure><video src="${escHtml(src)}"${poster}${size(preview)}></video><a href="${original}">${label}</a></figure>`
+                : `<figure><a href="${original}">${picture(preview)}${label}</a></figure>`);
+            }
+          }
+        } else if (entity?.type === "DIVIDER") {
+          parts.push("<hr>");
+        } else if (entity?.type === "TWEET" && /^\d+$/.test(String(entity.data?.tweetId ?? ""))) {
+          const url = `https://x.com/i/status/${entity.data.tweetId}`;
+          parts.push(`<p><a href="${url}">${escHtml(shownAddress(url))}</a></p>`);
+        } else if (entity?.type === "MARKDOWN" && typeof entity.data?.markdown === "string") {
+          parts.push(marked.parse(entity.data.markdown, { async: false, gfm: true }));
+        }
+      }
+    } else if ((block.text ?? "").trim()) {
+      const words = articleInline(block, entities);
+      const heading = HEADING_TAGS[type];
+      parts.push(heading ? `<${heading}>${words}</${heading}>` : type === "blockquote" ? `<blockquote><p>${words}</p></blockquote>` : `<p>${words}</p>`);
+    }
+  }
+  return sanitizeBody(parts.join("")) || null;
 }
 
 export function tweetToCandidate(t: SdTweet): Candidate {
@@ -83,15 +199,37 @@ const MAX_PAGES = 10;
 const MAX_BACKLOG_PAGES = 10;
 /** Stretches kept per source; beyond this the oldest is given up and reported. */
 const MAX_BACKLOG = 5;
+/**
+ * How long a stretch left over stays worth reading. A run reads ten of its pages, so a search still not
+ * caught up after days is stuck (or its accounts moved between shards); what is left in it is older than
+ * the site's archive window anyway, and every further page buys posts that are already stored.
+ */
+const MAX_BACKLOG_AGE_MS = 3 * 86_400_000;
+/** The oldest instant a post id can name (the id scheme starts 2010-11-04); an invented id names none. */
+const ID_TIME_FLOOR_MS = Date.parse("2011-01-01T00:00:00Z");
 
 /** Where a newest-first search stopped at the page limit: the same query continues from `next`. */
 export interface XBacklog {
   query: string;
   next: string;
+  /** When it was first left over; missing from cursors kept before this was recorded. */
+  at?: string;
+}
+
+/** When a stretch was left over: its recorded creation, else the instant its since_id names. */
+function stretchSince(stretch: XBacklog): number | null {
+  const recorded = Date.parse(stretch.at ?? "");
+  if (Number.isFinite(recorded)) return recorded;
+  const sinceId = /since_id:(\d+)/.exec(stretch.query)?.[1];
+  if (!sinceId) return null;
+  const instant = Number((BigInt(sinceId) >> 22n) + 1288834974657n);
+  return instant >= ID_TIME_FLOOR_MS ? instant : null;
 }
 
 export interface XRead {
   tweets: SdTweet[];
+  /** Paid search pages whose business effects must be committed before their receipts complete. */
+  receiptIds: number[];
   lastId: string | null;
   /** Stretches still to read, oldest first (kept in the source cursor). */
   backlog: XBacklog[];
@@ -99,7 +237,7 @@ export interface XRead {
   /** The new-post search stopped at the page limit; the rest joined the backlog. */
   truncated: boolean;
   backlogPages: number;
-  /** Stretches given up (too many, or the provider refused to continue one): posts in them may be missing. */
+  /** Stretches given up (too many, too old, or the provider refused to continue one): posts in them may be missing. */
   dropped: number;
 }
 
@@ -116,11 +254,29 @@ export interface XFetch extends Omit<XRead, "tweets"> {
  */
 export async function readXSearch(base: string, opts: { lastId: string | null; backlog: XBacklog[]; subject: string; type?: "Latest" | "Top" }): Promise<XRead> {
   const { lastId } = opts;
-  const backlog = opts.backlog.map((b) => ({ ...b }));
+  // One stretch per query, and none left over for days. A shard's stretches travel with its accounts, so
+  // regrouping can leave copies of the same query at different positions in several shards, each of them
+  // buying the same pages again; a stretch the page limit never catches up with only buys archived posts.
+  let dropped = 0;
+  const stretches = new Set<string>();
+  const now = Date.now();
+  const backlog = opts.backlog
+    .filter((b) => {
+      if (stretches.has(b.query)) return false;
+      stretches.add(b.query);
+      const since = stretchSince(b);
+      if (since !== null && now - since > MAX_BACKLOG_AGE_MS) {
+        dropped += 1;
+        return false;
+      }
+      return true;
+    })
+    .map((b) => ({ ...b }));
   const window = windowKey();
   const search = (query: string, cursor: string | null) =>
     searchTweets(query, { purpose: "source_fetch", subject: opts.subject, window, type: opts.type ?? "Latest", cursor });
   const all: SdTweet[] = [];
+  const receiptIds = new Set<number>();
   const query = lastId ? `${base} since_id:${lastId}` : base;
   let cursor: string | null = null;
   let pages = 0;
@@ -133,15 +289,16 @@ export async function readXSearch(base: string, opts: { lastId: string | null; b
       // A later page failing keeps the pages already read; the search goes on from there next run.
       if (!cursor) throw error;
       truncated = true;
-      backlog.push({ query, next: cursor });
+      backlog.push({ query, next: cursor, at: new Date().toISOString() });
       break;
     }
     pages += 1;
+    receiptIds.add(res.receiptId);
     all.push(...res.tweets);
     if (!lastId || !res.nextCursor || res.tweets.length === 0) break;
     if (pages >= MAX_PAGES) {
       truncated = true;
-      backlog.push({ query, next: res.nextCursor });
+      backlog.push({ query, next: res.nextCursor, at: new Date().toISOString() });
       break;
     }
     cursor = res.nextCursor;
@@ -149,7 +306,6 @@ export async function readXSearch(base: string, opts: { lastId: string | null; b
 
   // Older stretches, oldest first. Budget, account or passing trouble leaves them for the next run; a
   // position the provider refuses as a bad request (an expired cursor) is given up.
-  let dropped = 0;
   while (backlog.length > MAX_BACKLOG) {
     backlog.shift();
     dropped += 1;
@@ -169,6 +325,7 @@ export async function readXSearch(base: string, opts: { lastId: string | null; b
       break;
     }
     backlogPages += 1;
+    receiptIds.add(res.receiptId);
     all.push(...res.tweets);
     if (!res.nextCursor || res.tweets.length === 0) backlog.shift();
     else stretch.next = res.nextCursor;
@@ -177,15 +334,19 @@ export async function readXSearch(base: string, opts: { lastId: string | null; b
   const seen = new Set<string>();
   const tweets = all.filter((t) => !t.retweeted_status && !seen.has(t.id_str) && !!seen.add(t.id_str));
   const maxId = tweets.reduce<string | null>((m, t) => (m === null || BigInt(t.id_str) > BigInt(m) ? t.id_str : m), lastId);
-  return { tweets, lastId: maxId, backlog, pages, truncated, backlogPages, dropped };
+  return { tweets, receiptIds: [...receiptIds], lastId: maxId, backlog, pages, truncated, backlogPages, dropped };
 }
 
-/** One account's own search (its first fetch, a query of its own, or a manual run from the admin). */
-export async function fetchXSearch(source: SourceRow): Promise<XFetch> {
-  const base = String(source.config.query ?? "");
+/**
+ * One account's own search (its first fetch, a query of its own, or a manual run from the admin), from
+ * its watermark or from an earlier post (`since`).
+ */
+export async function fetchXSearch(source: SourceRow, since?: string): Promise<XFetch> {
+  const handle = selfThreadHandle(source);
+  const base = handle ? `from:${handle} (-filter:replies OR filter:self_threads)` : String(source.config.query ?? "");
   if (!base) throw new FetchError("query missing");
   const { tweets, ...read } = await readXSearch(base, {
-    lastId: source.cursor?.lastTweetId ?? null,
+    lastId: since ?? source.cursor?.lastTweetId ?? null,
     backlog: Array.isArray(source.cursor?.xBacklog) ? source.cursor.xBacklog : [],
     subject: `source:${source.id}`,
     type: source.config.searchType ?? "Latest",
@@ -193,10 +354,11 @@ export async function fetchXSearch(source: SourceRow): Promise<XFetch> {
   return { candidates: tweets.map(tweetToCandidate), ...read };
 }
 
-// --- Shards: plain account queries read together ------------------------------------------------
+// Shards: plain account queries read together. One search per account overran the SocialData budget on
+// production's first day (2026-09-28).
 
 /** A query that can share a search: exactly "from:handle -filter:replies", newest first. */
-const SHARDABLE = /^from:([A-Za-z0-9_]{1,15}) -filter:replies$/i;
+const SHARDABLE = /^from:[A-Za-z0-9_]{1,15} -filter:replies$/i;
 /** The same test in SQL, for the schedulers. */
 export const SHARDABLE_SQL = "^from:[A-Za-z0-9_]{1,15} -filter:replies$";
 /** SocialData refuses queries over 512 characters; the since_id watermark takes about 30 of them. */
@@ -206,11 +368,19 @@ const SHARD_MAX_ACCOUNTS = 24;
 /** The account a source reads, when it can share a search: a plain query and a watermark already set. */
 export function shardHandle(s: Pick<SourceRow, "kind" | "config" | "cursor">): string | null {
   if (s.kind !== "x_search" || (s.config.searchType ?? "Latest") !== "Latest" || !s.cursor?.lastTweetId) return null;
-  return SHARDABLE.exec(String(s.config.query ?? ""))?.[1] ?? null;
+  return SHARDABLE.test(String(s.config.query ?? "")) ? xHandle(s.config) : null;
 }
 
-export function shardQuery(handles: string[]): string {
-  return `(${handles.map((h) => `from:${h}`).join(" OR ")}) -filter:replies`;
+/** Verified publisher identity permits its own announcement thread, not conversations with others. */
+export function selfThreadHandle(s: Pick<SourceRow, "config">): string | null {
+  if (s.config.publisherRole !== "organization" && s.config.publisherRole !== "person") return null;
+  return SHARDABLE.test(String(s.config.query ?? "")) ? xHandle(s.config) : null;
+}
+
+export function shardQuery(handles: string[], selfThreads: string[] = []): string {
+  const posts = `(${handles.map((h) => `from:${h}`).join(" OR ")}) -filter:replies`;
+  const own = handles.filter((h) => selfThreads.includes(h));
+  return own.length ? `(${posts} OR (${own.map((h) => `from:${h}`).join(" OR ")}) filter:self_threads)` : posts;
 }
 
 export interface XShard {
@@ -225,10 +395,10 @@ export interface XShard {
  * accounts stay together between runs; a source added or removed shifts only the shards after it.
  */
 export function planXShards(sources: Array<Pick<SourceRow, "id" | "kind" | "config" | "cursor" | "participation_mode">>): XShard[] {
-  const byMode = new Map<string, Array<{ id: string; handle: string }>>();
+  const byMode = new Map<string, Array<{ id: string; handle: string; selfThread: boolean }>>();
   for (const s of sources) {
     const handle = shardHandle(s);
-    if (handle) byMode.set(s.participation_mode, [...(byMode.get(s.participation_mode) ?? []), { id: s.id, handle }]);
+    if (handle) byMode.set(s.participation_mode, [...(byMode.get(s.participation_mode) ?? []), { id: s.id, handle, selfThread: !!selfThreadHandle(s) }]);
   }
   const shards: XShard[] = [];
   for (const [mode, list] of [...byMode].sort(([a], [b]) => a.localeCompare(b))) {
@@ -239,7 +409,7 @@ export function planXShards(sources: Array<Pick<SourceRow, "id" | "kind" | "conf
       current = [];
     };
     for (const s of list) {
-      if (current.length >= SHARD_MAX_ACCOUNTS || shardQuery([...current, s].map((c) => c.handle)).length > SHARD_QUERY_MAX) close();
+      if (current.length >= SHARD_MAX_ACCOUNTS || shardQuery([...current, s].map((c) => c.handle), [...current, s].filter((c) => c.selfThread).map((c) => c.handle)).length > SHARD_QUERY_MAX) close();
       current.push(s);
     }
     close();

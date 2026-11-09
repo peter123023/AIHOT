@@ -1,25 +1,46 @@
 // Checks the selection against your own labelled samples (a "gold set"): each case runs the site's
 // selection steps (editorial/analyze.ts) — the prefilter, then the score prompt twice with every model in
-// --models, the two scores deciding against the source tier's threshold — and is compared with your
-// decision. A threshold sweep shows what another threshold would have done. The format of the gold file
-// is in docs/selection.md (industry/gold.example.jsonl has two made-up cases).
-// Usage: node --env-file=.env scripts/eval-selection.ts --gold .data/gold.jsonl [--models default,deepseek-flash] [--n 200] [--label "..."]
+// --models, the two scores deciding against the case's tier threshold (gold cases carry no source class) — and is compared with your
+// decision. A threshold sweep shows what another threshold would have done. The gold file has one case
+// per line as eval-selection-core.ts describes; lines starting with // are skipped.
+// Usage: node --env-file=.env scripts/eval-selection.ts [--gold .data/gold.jsonl] [--models default,deepseek-flash] [--n 200] [--split all] [--label "..."]
 // Receipts make re-runs free; "either" cases are excluded from decisive metrics. Each run is also
 // imported into SelectBench (admin → SelectBench) with every case, unless --no-import is given.
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { parseArgs } from "node:util";
+import { DEPLOYMENT } from "@aihot/site";
 import { REPO_ROOT } from "@aihot/backend/config";
-import { closeDb, sql } from "@aihot/backend/db";
-import { ANALYZE_PROMPT_VERSION, normalizeAnalysis, runAnalysis, type AnalyzeInputArticle } from "@aihot/backend/editorial/analyze";
+import { closeDb } from "@aihot/backend/db";
+import {
+  SELECTION_PROMPT_VERSION,
+  awaitsMaterial,
+  buildScoreInput,
+  runSelectionPrefilter,
+  runSelectionScores,
+  scoresSelect,
+  selectionThreshold,
+  shownScore,
+  type AnalysisRun,
+  type AnalyzeInputArticle,
+} from "@aihot/backend/editorial/analyze";
 import { importSelectBenchRun } from "@aihot/backend/admin/selectbench";
+import { evalModels, pmap, positiveInt, safeReportNamePart, sampleCases, usageFor } from "./eval-tools.ts";
+import { parseSelectionGoldJsonl, selectionMetrics, selectionThresholdMetrics, type SelectionDecision, type SelectionGoldRow } from "./eval-selection-core.ts";
+
+// Without options: the site's gold set (site.ts DEPLOYMENT.selectionGold), else the whole of .data/gold.jsonl
+// (up to 200 cases), swept over a wide range of thresholds.
+const own = DEPLOYMENT.selectionGold;
+const defaults = own
+  ? { gold: own.file, n: String(own.sample), split: own.split, sweep: own.sweep }
+  : { gold: ".data/gold.jsonl", n: "200", split: "all", sweep: [40, 90] };
 
 const { values } = parseArgs({
   options: {
-    gold: { type: "string", default: ".data/gold.jsonl" },
-    models: { type: "string", default: "default" },
-    n: { type: "string", default: "200" },
-    split: { type: "string", default: "all" },
+    gold: { type: "string", default: defaults.gold },
+    models: { type: "string" },
+    n: { type: "string", default: defaults.n },
+    split: { type: "string", default: defaults.split },
     concurrency: { type: "string", default: "6" },
     seed: { type: "string", default: "7" },
     label: { type: "string" },
@@ -27,29 +48,11 @@ const { values } = parseArgs({
   },
 });
 
-interface GoldRow {
-  caseId: string;
-  material: { title: string; originalTitle: string | null; publishedAt: string | null; sourceName: string; bodyZh: string | null; bodyOriginal: string | null };
-  sourceFacts: { sourceKind: string; sourceTier?: string; firstParty?: boolean; language?: string | null };
-  /** Optional: a split (e.g. development / holdout) and a stratum for reading the mistakes. */
-  samplingContext?: { benchmarkSplit?: string; samplingStratum?: string };
-  gold: { decision: "select" | "reject" | "either" };
-}
+const rows = parseSelectionGoldJsonl(readFileSync(path.resolve(REPO_ROOT, values.gold!), "utf8"));
+const sample = sampleCases(rows, { split: values.split!, n: positiveInt(values.n!, "n"), seed: Number(values.seed) });
+const concurrency = positiveInt(values.concurrency!, "concurrency");
 
-const rows: GoldRow[] = readFileSync(path.resolve(REPO_ROOT, values.gold!), "utf8")
-  .split("\n").filter((l) => l.trim() && !l.trim().startsWith("//")).map((l) => JSON.parse(l));
-
-// Deterministic stratified sample.
-function rng(seed: number) {
-  let s = seed >>> 0;
-  return () => ((s = (s * 1664525 + 1013904223) >>> 0) / 2 ** 32);
-}
-const rand = rng(Number(values.seed));
-const pool = values.split === "all" ? rows : rows.filter((r) => r.samplingContext?.benchmarkSplit === values.split);
-const shuffled = pool.map((r) => ({ r, k: rand() })).sort((a, b) => a.k - b.k).map((x) => x.r);
-const sample = shuffled.slice(0, Number(values.n));
-
-function toInput(r: GoldRow): AnalyzeInputArticle {
+function toInput(r: SelectionGoldRow): AnalyzeInputArticle {
   const m = r.material;
   const isX = r.sourceFacts.sourceKind === "x_search";
   const body = m.bodyOriginal || m.bodyZh || null;
@@ -69,86 +72,97 @@ function toInput(r: GoldRow): AnalyzeInputArticle {
   };
 }
 
-async function pmap<T, R>(items: T[], limit: number, fn: (t: T) => Promise<R>): Promise<R[]> {
-  const out: R[] = new Array(items.length);
-  let i = 0;
-  await Promise.all(Array.from({ length: limit }, async () => {
-    while (i < items.length) {
-      const idx = i++;
-      out[idx] = await fn(items[idx]!);
-    }
-  }));
-  return out;
+/**
+ * A case as the site's rules leave it: `relevance` is what the prefilter (or missing material) decided,
+ * `scores` the two scores held against the case's tier threshold. The eval writes no reader-facing copy;
+ * an item past the prefilter is taken as written up, as the site writes one for every such item.
+ */
+interface Outcome {
+  r: SelectionGoldRow;
+  relevance: "pass" | "block" | "unknown" | null;
+  scores: AnalysisRun["scores"];
+  receiptIds: number[];
+  error: string | null;
 }
 
+/** The site's decision for the case, at its tier threshold or at `threshold`; null when the case failed. */
+const decide = (x: Outcome, threshold?: number): SelectionDecision | null =>
+  x.error !== null ? null : x.relevance === "pass" && scoresSelect(x.scores, threshold) ? "select" : "reject";
+
+const models = await evalModels(values.models, "score");
+
 const report: Record<string, unknown> = {};
-for (const model of values.models!.split(",")) {
-  const started = Date.now();
-  const results = await pmap(sample, Number(values.concurrency), async (r) => {
+for (const model of models) {
+  const started = performance.now();
+  // Two gold cases can have different source metadata / thresholds while rendering the same score prompt.
+  // Share only that score result (including a failure); prefilter and threshold semantics remain per case.
+  const scoreRequests = new Map<string, Promise<{ scores: AnalysisRun["scores"]; receiptIds: number[]; error: string | null }>>();
+  const results = await pmap(sample, concurrency, async (r): Promise<Outcome> => {
+    const input = toInput(r);
+    const receiptIds: number[] = [];
+    const outcome = (relevance: Outcome["relevance"], scores: AnalysisRun["scores"] = null, error: string | null = null): Outcome =>
+      ({ r, relevance, scores, receiptIds, error });
+    // Only a title: the site waits for material, without a model call.
+    if (awaitsMaterial(input)) return outcome("unknown");
     try {
-      const res = await runAnalysis(toInput(r), { scoreModel: model, stages: "selection" });
-      const out = normalizeAnalysis(res);
-      return { r, out, receiptIds: [res.prefilter.receiptId, ...(res.scores?.receiptIds ?? [])], error: null as string | null };
+      const prefilter = await runSelectionPrefilter(input, {}, (id) => receiptIds.push(id));
+      if (prefilter.label === "BLOCK") return outcome("block");
+      const threshold = selectionThreshold(input.source);
+      if (threshold === null) return outcome("pass");
+
+      const key = buildScoreInput(input);
+      let request = scoreRequests.get(key);
+      if (!request) {
+        const sharedReceiptIds: number[] = [];
+        request = runSelectionScores(input, { scoreModel: model }, (id) => sharedReceiptIds.push(id)).then(
+          (scores) => ({ scores, receiptIds: sharedReceiptIds, error: null }),
+          (error: unknown) => ({ scores: null, receiptIds: sharedReceiptIds, error: String(error).slice(0, 200) }),
+        );
+        scoreRequests.set(key, request);
+      }
+      const shared = await request;
+      receiptIds.push(...shared.receiptIds);
+      if (shared.error) return outcome(null, null, shared.error);
+      // Model output is independent of source tier; the decision threshold is not.
+      return outcome("pass", shared.scores ? { ...shared.scores, threshold } : null);
     } catch (error) {
-      return { r, out: null, receiptIds: [] as number[], error: String(error).slice(0, 200) };
+      return outcome(null, null, String(error).slice(0, 200));
     }
   });
-  let tp = 0, fp = 0, fn = 0, tn = 0, either = 0, errors = 0;
+  const metrics = selectionMetrics(results.map((x) => ({ gold: x.r.gold.decision, decision: decide(x) })));
   const mistakes: Array<Record<string, unknown>> = [];
   for (const x of results) {
-    if (!x.out) { errors++; continue; }
-    const pred = x.out.selected ? "select" : "reject";
+    const pred = decide(x);
     const gold = x.r.gold.decision;
-    if (gold === "either") { either++; continue; }
-    if (pred === "select" && gold === "select") tp++;
-    else if (pred === "select" && gold === "reject") { fp++; mistakes.push({ kind: "FP", title: x.r.material.title, score: x.out.score, reason: x.out.reasonZh, stratum: x.r.samplingContext?.samplingStratum ?? null }); }
-    else if (pred === "reject" && gold === "select") { fn++; mistakes.push({ kind: "FN", title: x.r.material.title, score: x.out.score, relevance: x.out.relevance, stratum: x.r.samplingContext?.samplingStratum ?? null }); }
-    else tn++;
+    if (pred === null || gold === "either") continue;
+    if (pred === "select" && gold === "reject") mistakes.push({ kind: "FP", title: x.r.material.title, score: shownScore(x.scores), stratum: x.r.samplingContext?.samplingStratum ?? null });
+    else if (pred === "reject" && gold === "select") mistakes.push({ kind: "FN", title: x.r.material.title, score: shownScore(x.scores), relevance: x.relevance, stratum: x.r.samplingContext?.samplingStratum ?? null });
   }
-  const receiptIds = results.flatMap((x) => x.receiptIds);
-  const [usage] = receiptIds.length
-    ? await sql<{ tin: number; tout: number; latency: number }[]>`
-        SELECT sum((usage->>'prompt_tokens')::int) AS tin, sum((usage->>'completion_tokens')::int) AS tout,
-               avg((response->>'_latencyMs')::int) AS latency
-        FROM receipts WHERE id IN ${sql(receiptIds)}`
-    : [{ tin: 0, tout: 0, latency: 0 }];
-  const precision = tp / Math.max(1, tp + fp);
-  const recall = tp / Math.max(1, tp + fn);
-  const f1 = (2 * precision * recall) / Math.max(1e-9, precision + recall);
+  const usage = await usageFor(results.flatMap((x) => x.receiptIds));
   const summary = {
-    model, n: sample.length, decisive: tp + fp + fn + tn, either, errors, tp, fp, fn, tn,
-    accuracy: +((tp + tn) / Math.max(1, tp + fp + fn + tn)).toFixed(3),
-    precision: +precision.toFixed(3), recall: +recall.toFixed(3), f1: +f1.toFixed(3),
-    selectedRate: +((tp + fp) / Math.max(1, tp + fp + fn + tn)).toFixed(3),
-    goldSelectRate: +((tp + fn) / Math.max(1, tp + fp + fn + tn)).toFixed(3),
-    tokensIn: Number(usage?.tin ?? 0), tokensOut: Number(usage?.tout ?? 0), avgLatencyMs: Math.round(Number(usage?.latency ?? 0)),
-    wallSeconds: Math.round((Date.now() - started) / 1000),
+    model,
+    ...metrics,
+    ...usage,
+    wallSeconds: Math.round((performance.now() - started) / 1000),
   };
   console.log(JSON.stringify(summary));
-  // Threshold sweep on the raw attention score (selection rule = relevance pass && score >= t).
-  const sweep: Array<Record<string, number>> = [];
-  for (let t = 40; t <= 90; t += 2) {
-    let a = 0, b = 0, c = 0, d = 0;
-    for (const x of results) {
-      if (!x.out || x.r.gold.decision === "either") continue;
-      const pred = x.out.relevance === "pass" && x.out.score !== null && x.out.score >= t;
-      const g = x.r.gold.decision === "select";
-      if (pred && g) a++; else if (pred) b++; else if (g) c++; else d++;
-    }
-    const P = a / Math.max(1, a + b), R = a / Math.max(1, a + c);
-    sweep.push({ t, acc: +((a + d) / Math.max(1, a + b + c + d)).toFixed(3), P: +P.toFixed(3), R: +R.toFixed(3), F1: +((2 * P * R) / Math.max(1e-9, P + R)).toFixed(3), sel: +((a + b) / Math.max(1, a + b + c + d)).toFixed(3) });
+  // Threshold sweep keeps valid-output metrics, while coverage and completeAcc charge decisive failures.
+  const thresholdCases = results.map((x) => ({ gold: x.r.gold.decision, available: x.error === null, passed: x.relevance === "pass", scores: x.scores }));
+  const sweep = [];
+  for (let t = defaults.sweep[0]; t <= defaults.sweep[1]; t += 2) {
+    sweep.push(selectionThresholdMetrics(thresholdCases, t));
   }
-  console.log(sweep.map((s) => `  t=${s.t} acc=${s.acc} P=${s.P} R=${s.R} F1=${s.F1} sel=${s.sel}`).join("\n"));
+  console.log(sweep.map((s) =>
+    `  t=${s.t} acc=${s.acc} completeAcc=${s.completeAcc} coverage=${s.coverage} P=${s.P} R=${s.R} F1=${s.F1} sel=${s.sel}`
+  ).join("\n"));
   const cases = results.map((x) => ({
     caseId: x.r.caseId,
     title: x.r.material.title,
     stratum: x.r.samplingContext?.samplingStratum ?? null,
     gold: x.r.gold.decision,
-    decision: x.out ? (x.out.selected ? "select" : "reject") : null,
-    score: x.out?.score ?? null,
-    relevance: x.out?.relevance ?? null,
-    category: x.out?.category ?? null,
-    reason: x.out?.reasonZh ?? null,
+    decision: decide(x),
+    score: shownScore(x.scores),
+    relevance: x.relevance,
     receiptId: x.receiptIds[0] ?? null,
     error: x.error,
   }));
@@ -156,8 +170,9 @@ for (const model of values.models!.split(",")) {
 }
 const outDir = path.join(REPO_ROOT, ".data/eval");
 mkdirSync(outDir, { recursive: true });
-const file = path.join(outDir, `selection-${values.split}-${values.n}-${Date.now()}.json`);
-const meta = { split: values.split, n: sample.length, seed: Number(values.seed), promptVersion: ANALYZE_PROMPT_VERSION, createdAt: new Date().toISOString() };
+const splitName = safeReportNamePart(values.split!);
+const file = path.join(outDir, `selection-${splitName}-${sample.length}-${Date.now()}.json`);
+const meta = { split: values.split, n: sample.length, seed: Number(values.seed), promptVersion: SELECTION_PROMPT_VERSION, createdAt: new Date().toISOString() };
 writeFileSync(file, JSON.stringify({ meta, models: report }, null, 2));
 console.log(`report: ${file}`);
 if (!values["no-import"]) {

@@ -17,7 +17,7 @@ export function normalizeUrl(input: string): string | null {
   u.hostname = u.hostname.toLowerCase().replace(/^www\./, "");
   u.protocol = "https:";
   if (u.port === "443" || u.port === "80") u.port = "";
-  // WeChat articles are identified by __biz/mid/idx/sn only.
+  // Keep the article address parameters, including sn when needed to open the long link.
   if (u.hostname === "mp.weixin.qq.com") {
     const keep = ["__biz", "mid", "idx", "sn"];
     const params = new URLSearchParams();
@@ -49,6 +49,20 @@ export function tweetIdFromUrl(url: string): string | null {
   return m ? m[1]! : null;
 }
 
+/** Page-confirmed account and post identifiers, independent of the signature or short access path. */
+export function wechatPostUrl(url: string): string | null {
+  let u: URL;
+  try { u = new URL(url); } catch { return null; }
+  if (!/^https?:$/.test(u.protocol) || u.hostname !== "mp.weixin.qq.com" || u.username || u.password || !/^\/s(?:\/[^/]+)?$/.test(u.pathname)) return null;
+  const post = new URL("https://mp.weixin.qq.com/s");
+  for (const key of ["__biz", "mid", "idx"]) {
+    const value = u.searchParams.get(key);
+    if (!value) return null;
+    post.searchParams.set(key, value);
+  }
+  return post.toString();
+}
+
 /**
  * Identity of material at an address. `keepFragment` is for sources whose entries are sections of one
  * page (release notes: overview#september-24-2026): without it every section is the same article.
@@ -59,7 +73,7 @@ export function identityKeyForUrl(url: string, opts: { keepFragment?: boolean } 
   const normalized = normalizeUrl(url);
   if (!normalized) return null;
   const fragment = opts.keepFragment ? new URL(url.trim()).hash : "";
-  return `url:${normalized}${fragment.length > 1 ? fragment : ""}`;
+  return `url:${wechatPostUrl(normalized) ?? normalized}${fragment.length > 1 ? fragment : ""}`;
 }
 
 function ipv4Blocked(o: [number, number, number, number]): boolean {
@@ -72,9 +86,8 @@ function ipv4Blocked(o: [number, number, number, number]): boolean {
     (a === 192 && b === 168) ||
     (a === 192 && b === 0 && (c === 0 || c === 2)) || // IETF protocol assignments, TEST-NET-1
     (a === 192 && b === 88 && c === 99) || // 6to4 relay anycast
+    (a === 198 && (b === 18 || b === 19)) || // benchmarking, also used by local fake-IP resolvers
     (a === 198 && b === 51 && c === 100) || (a === 203 && b === 0 && c === 113) // TEST-NET-2/3
-    // 198.18.0.0/15 stays allowed: fake-IP resolvers of local proxies (development machines) answer
-    // from it; nothing on the production host listens there.
   );
 }
 
@@ -138,57 +151,54 @@ export function isBlockedAddress(address: string): boolean {
   return false;
 }
 
-function ipv4Internal(o: [number, number, number, number]): boolean {
-  const [a, b] = o;
-  return a === 0 || a === 10 || a === 127 || (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+function ipv4PrivateService(o: [number, number, number, number]): boolean {
+  const [a, b, c, d] = o;
+  if (a === 100 && b === 100 && c === 100 && d === 200) return false; // Alibaba Cloud metadata, inside carrier-grade NAT
+  return a === 10 || a === 127 || (a === 100 && b >= 64 && b <= 127) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
 }
 
 /**
- * True when an address reaches this host or a private network: loopback, unspecified, private,
- * carrier-grade NAT, link-local and metadata, unique-local and site-local, also inside IPv6 (mapped,
- * compatible, NAT64, 6to4). The narrower check for names the egress proxy resolves itself: a poisoned
- * local answer (Teredo, documentation, reserved) says nothing about where the proxy will connect.
+ * Where a self-hosted service may run: loopback, private, carrier-grade NAT and unique local
+ * addresses, never link-local, cloud metadata (100.100.100.200, fd00:ec2::254), multicast or reserved ranges.
  */
-export function isInternalAddress(address: string): boolean {
+function privateServiceAddress(address: string): boolean {
   const v4 = parseIpv4(address);
-  if (v4) return ipv4Internal(v4);
+  if (v4) return ipv4PrivateService(v4);
   const g = ipv6Groups(address);
-  if (!g) return true;
-  const [g0, g1, g2, g3, g4, g5, g6, g7] = g as [number, number, number, number, number, number, number, number];
-  if (g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0 && (g5 === 0 || g5 === 0xffff)) {
-    if (g5 === 0 && g6 === 0 && (g7 === 0 || g7 === 1)) return true;
-    return ipv4Internal(embeddedIpv4(g6, g7));
-  }
-  if (g0 === 0x64 && g1 === 0xff9b && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0) return ipv4Internal(embeddedIpv4(g6, g7));
-  if (g0 === 0x64 && g1 === 0xff9b && g2 === 1) return true;
-  if (g0 === 0x2002) return ipv4Internal(embeddedIpv4(g1, g2));
-  return (g0 & 0xfe00) === 0xfc00 || (g0 & 0xffc0) === 0xfe80 || (g0 & 0xffc0) === 0xfec0;
+  if (!g) return false;
+  if (g.slice(0, 5).every((x) => x === 0) && g[5] === 0xffff) return ipv4PrivateService(embeddedIpv4(g[6]!, g[7]!));
+  if (g.slice(0, 7).every((x) => x === 0) && g[7] === 1) return true; // ::1
+  return (g[0]! & 0xfe00) === 0xfc00 && !(g[0] === 0xfd00 && g[1] === 0xec2 && g.slice(2, 7).every((x) => x === 0) && g[7] === 0x254);
+}
+
+/** A listed private feed host (PRIVATE_FEED_HOSTS) may also use private service addresses. */
+function refusedAddress(address: string, listed: boolean): boolean {
+  return isBlockedAddress(address) && !(listed && privateServiceAddress(address));
 }
 
 function blockedHostname(host: string): boolean {
-  return host === "localhost" || host.endsWith(".localhost") || host.endsWith(".internal") || host === "metadata.google.internal";
+  const name = host.replace(/\.$/, "");
+  return name === "localhost" || name.endsWith(".localhost") || name.endsWith(".internal") || name === "metadata.google.internal";
 }
 
 /**
- * Rejects URLs that name or resolve to loopback, private, link-local or cloud-metadata addresses
- * (SSRF guard). A direct request is checked again at connect time, so a second DNS answer cannot slip
- * past. A name sent through the egress proxy (`proxied`) is resolved and dialled abroad, so only an
- * internal local answer refuses it: the local resolver's poisoned answers for blocked sites (Teredo and
- * other unroutable addresses) would otherwise refuse them. Only local debugging may disable the guard
- * via ALLOW_PRIVATE_NETWORK_FETCH.
+ * Rejects non-HTTP URLs and private destinations. Direct requests check the system DNS again at
+ * connect time; proxy requests supply their outbound resolver and pin its answer in the tunnel.
+ * Only local debugging may disable the guard via ALLOW_PRIVATE_NETWORK_FETCH; `privateHosts` are whole
+ * names that may reach a self-hosted service on a private address.
  */
-export async function assertPublicUrl(url: string, allowPrivate = false, proxied = false): Promise<URL> {
+export async function assertPublicUrl(url: string, allowPrivate = false, resolve?: (host: string) => Promise<string[]>, privateHosts: readonly string[] = []): Promise<URL> {
   const u = new URL(url);
   if (u.protocol !== "http:" && u.protocol !== "https:") throw new Error(`Blocked protocol ${u.protocol}`);
   if (allowPrivate) return u;
   const host = u.hostname.replace(/^\[|\]$/g, "").toLowerCase();
-  if (blockedHostname(host)) throw new Error(`Blocked host ${host}`);
+  const listed = privateHosts.includes(host);
+  if (!listed && blockedHostname(host)) throw new Error(`Blocked host ${host}`);
   const literal = net.isIP(host) !== 0;
-  const addresses = literal ? [{ address: host }] : await lookup(host, { all: true });
+  const addresses = literal ? [{ address: host }] : resolve ? (await resolve(host)).map((address) => ({ address })) : await lookup(host, { all: true });
   if (addresses.length === 0) throw new Error(`No address for ${host}`);
-  const refused = proxied && !literal ? isInternalAddress : isBlockedAddress;
   for (const { address } of addresses) {
-    if (refused(address)) throw new Error(`Blocked private address for ${host}`);
+    if (refusedAddress(address, listed)) throw new Error(`Blocked private address for ${host}`);
   }
   return u;
 }
@@ -197,17 +207,19 @@ type LookupCallback = (err: NodeJS.ErrnoException | null, address: string | Arra
 
 /**
  * DNS lookup for outbound sockets that refuses blocked addresses. Used as the connect-time lookup,
- * it closes the gap between the URL check and the connection (DNS rebinding).
+ * it closes the gap between the URL check and the connection (DNS rebinding). `privateHosts` as in
+ * assertPublicUrl.
  */
-export function guardedLookup(hostname: string, options: { all?: boolean; family?: number } | number, callback: LookupCallback): void {
+export function guardedLookup(hostname: string, options: { all?: boolean; family?: number } | number, callback: LookupCallback, privateHosts: readonly string[] = []): void {
   const opts = typeof options === "number" ? { family: options } : options;
-  if (blockedHostname(hostname.toLowerCase())) {
+  const listed = privateHosts.includes(hostname.toLowerCase());
+  if (!listed && blockedHostname(hostname.toLowerCase())) {
     callback(Object.assign(new Error(`Blocked host ${hostname}`), { code: "EBLOCKED" }), opts.all ? [] : "", 0);
     return;
   }
   lookup(hostname, { all: true, family: opts.family ?? 0 }).then(
     (list) => {
-      const bad = list.find((a) => isBlockedAddress(a.address));
+      const bad = list.find((a) => refusedAddress(a.address, listed));
       if (bad || list.length === 0) {
         callback(Object.assign(new Error(`Blocked private address for ${hostname}`), { code: "EBLOCKED" }), opts.all ? [] : "", 0);
         return;

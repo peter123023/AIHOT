@@ -1,47 +1,51 @@
-// Outward HTTP behaviour, defined once: CORS, cache lifetimes, redirects and which process owns a path.
-// The API server and the web server both read this module.
+// Outward HTTP behaviour, defined once: CORS, the public interface version, redirects and which process
+// owns a path, the engine's and then those of the site's modules. The API server and the web server both
+// read this module.
+import { ABOUT, POLICY, SITE } from "@aihot/site";
+import { MODULES } from "@aihot/site/modules";
 
 /** CORS for /api/v1/* and /openapi-v1.json. */
 export const PUBLIC_API_CORS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
   "Access-Control-Allow-Headers": "Accept, If-None-Match, If-Modified-Since",
-  "Access-Control-Expose-Headers": "ETag, Last-Modified, Retry-After, X-Request-Id, Link",
+  "Access-Control-Expose-Headers": [
+    "ETag",
+    "Last-Modified",
+    "Retry-After",
+    "X-Request-Id",
+    "Deprecation",
+    "Sunset",
+    "Link",
+    ...Object.keys(POLICY.terms.headers ?? {}),
+  ].join(", "),
   "Access-Control-Max-Age": "86400",
 };
 
-/** Cache-Control per v1 operation. */
-export const V1_CACHE_CONTROL = {
-  items: "public, max-age=60, s-maxage=60, stale-while-revalidate=300",
-  codexResets: "public, max-age=60, s-maxage=60, stale-while-revalidate=60",
-  hotTopics: "public, max-age=60, s-maxage=60, stale-while-revalidate=60",
-  storyByPublicId: "public, max-age=60, s-maxage=60, stale-while-revalidate=60",
-  dailies: "public, max-age=60, s-maxage=60, stale-while-revalidate=300",
-  latestDaily: "public, max-age=60, s-maxage=60, stale-while-revalidate=300",
-  dailyByDate: "public, max-age=300, s-maxage=300, stale-while-revalidate=3600",
-  selectedSnapshot: "public, max-age=300, s-maxage=300, stale-while-revalidate=900",
-  selectedChanges: "public, max-age=60, s-maxage=60, stale-while-revalidate=60",
-} as const;
+/** MCP and the v1 OpenAPI carry one public version, the site's (site/site.ts); it only goes up. */
+export const PUBLIC_INTERFACE_VERSION = SITE.interfaceVersion;
 
-export const RSS_CACHE_CONTROL = "public, max-age=300, s-maxage=300, stale-while-revalidate=900";
 export const NO_STORE = "no-store";
 
 export interface RedirectRule {
-  match: "exact" | "regex" | "prefix";
+  match: "exact" | "regex" | "prefix" | "canonical";
+  /** For canonical, the fixed lowercase address, whose aliases redirect to this path. */
   path: string;
   status: 301 | 302 | 307 | 308 | 404 | 410;
   /** Relative Location. `$1`… refer to regex groups; `*` appends the remainder for prefix rules. */
   location?: string;
   keepQuery?: boolean;
+  /** Appended after the query, as `#fragment`. */
+  fragment?: string;
   headers?: Record<string, string>;
   why?: string;
 }
 
 /** Redirects. Locations are always relative, so they stay right behind any proxy. */
-export const REDIRECTS: RedirectRule[] = [
+const ENGINE_REDIRECTS: RedirectRule[] = [
   {
     match: "regex",
-    path: "^/(all|about|agent|changelog|codex-reset|feedback|starred|more|privacy|terms)/+$",
+    path: "^/(all|about|agent|changelog|feedback|starred|more|privacy|terms)/+$",
     status: 301,
     location: "/$1",
     keepQuery: true,
@@ -53,12 +57,12 @@ export const REDIRECTS: RedirectRule[] = [
     location: "/feed.xml",
     keepQuery: true,
     why: "RSS reader aliases",
+    // A subscription address may carry its reader's own query, which the Location repeats: the redirect
+    // never enters shared caches.
+    headers: { "Cache-Control": "private, no-store" },
   },
-  { match: "exact", path: "/leaderboard/methodology", status: 308, location: "/leaderboard/sources" },
-  { match: "regex", path: "^/leaderboard/category/(aesthetics|writing)$", status: 307, location: "/leaderboard", why: "data-layer categories not yet public" },
-  { match: "exact", path: "/leaderboard/category/overall", status: 404, why: "the overall board lives at /leaderboard" },
-  { match: "prefix", path: "/sources", status: 302, location: "/admin/sources*", why: "admin bookmarks" },
 ];
+
 
 export interface RedirectDecision {
   status: number;
@@ -66,10 +70,25 @@ export interface RedirectDecision {
   headers: Record<string, string>;
 }
 
+/** Match static aliases before routing, decoding unreserved bytes without turning escaped separators into paths. */
+function normalizedPublicPath(pathname: string): string {
+  if (!pathname.startsWith("/") || !/[%A-Z\\]|\/(?:\/|\.{1,2}(?:\/|$)|$)/.test(pathname)) return pathname;
+  // An origin-form path starting with // still belongs to this host. URL handles dot segments.
+  const path = new URL("http://redirect.local" + pathname).pathname;
+  return path.replace(/%([a-f0-9]{2})/gi, (encoded, hex: string) => {
+    const char = String.fromCharCode(Number.parseInt(hex, 16));
+    return /^[a-z0-9._~-]$/i.test(char) ? char : encoded;
+  }).toLowerCase().replace(/\/{2,}/g, "/").replace(/\/$/, "") || "/";
+}
+
 export function resolveRedirect(pathname: string, search: string): RedirectDecision | null {
-  for (const rule of REDIRECTS) {
+  let normalized: string | undefined;
+  for (const rule of tables().redirects) {
     let location: string | null = null;
-    if (rule.match === "exact") {
+    if (rule.match === "canonical") {
+      if (pathname === rule.path || (normalized ??= normalizedPublicPath(pathname)) !== rule.path) continue;
+      location = rule.path;
+    } else if (rule.match === "exact") {
       if (pathname !== rule.path) continue;
       location = rule.location ?? null;
     } else if (rule.match === "prefix") {
@@ -84,6 +103,7 @@ export function resolveRedirect(pathname: string, search: string): RedirectDecis
       location = rule.location ? rule.location.replace(/\$(\d)/g, (_s, i: string) => m[Number(i)] ?? "") : null;
     }
     if (location && rule.keepQuery && search) location += search;
+    if (location && rule.fragment) location += `#${rule.fragment}`;
     return { status: rule.status, location, headers: rule.headers ?? {} };
   }
   return null;
@@ -102,12 +122,20 @@ export const OAUTH_PROBE_PATHS = [
   "/api/mcp/.well-known/openid-configuration",
 ];
 
+/** Root addresses of the about page's contact codes that were linked from outside (ABOUT.maker), served by routes/static.ts. */
+export const CONTACT_ALIASES = (["wechat", "feishu"] as const).flatMap((slot) => {
+  const file = ABOUT.maker?.[slot]?.alias;
+  return file ? [{ slot, file }] : [];
+});
+
+const literal = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
 /**
  * Paths served by the api process; everything else is the web process. The web server proxies these to
  * the api (a reverse proxy in front may also route them straight to it). Patterns are anchored so page
  * paths such as /feedback never fall into /feed.
  */
-export const API_OWNED_PATTERNS: RegExp[] = [
+const ENGINE_API_PATHS: RegExp[] = [
   /^\/api\//,
   /^\/feed(\.xml|\/.*)?$/,
   /^\/(rss|rss\.xml|atom\.xml)$/,
@@ -116,11 +144,28 @@ export const API_OWNED_PATTERNS: RegExp[] = [
   /^\/sitemaps\//,
   /^\/\.well-known\//,
   /^\/(favicon\.ico|icon\.png|icon-192\.png|apple-icon\.png|logo\.svg)$/,
-  /^\/(model-providers|leaderboard-sources|og|contact)\//,
+  ...(SITE.rootIcons.length ? [new RegExp(`^\\/(${SITE.rootIcons.map(literal).join("|")})$`)] : []),
+  /^\/(og|contact)\//,
+  ...(CONTACT_ALIASES.length ? [new RegExp(`^\\/(${CONTACT_ALIASES.map((a) => literal(a.file)).join("|")})$`)] : []),
   /^\/[0-9a-f]{32}\.txt$/,
   /^\/items\/[^/]+\/markdown$/,
 ];
 
+/** Read on first use, so a browser bundle that only needs this module's constants leaves the modules' tables out. */
+let built: { redirects: RedirectRule[]; apiPaths: RegExp[] } | null = null;
+function tables() {
+  built ??= {
+    redirects: [...ENGINE_REDIRECTS, ...MODULES.flatMap((m) => m.redirects ?? [])],
+    apiPaths: [...ENGINE_API_PATHS, ...MODULES.flatMap((m) => m.apiPaths ?? [])],
+  };
+  return built;
+}
+
+/** The engine's api paths, then the site's modules'. */
+export function apiOwnedPatterns(): readonly RegExp[] {
+  return tables().apiPaths;
+}
+
 export function isApiOwned(pathname: string): boolean {
-  return API_OWNED_PATTERNS.some((re) => re.test(pathname));
+  return tables().apiPaths.some((re) => re.test(pathname));
 }

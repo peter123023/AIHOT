@@ -6,6 +6,8 @@
 import { useEffect, useMemo, useRef } from "react";
 import { useNavigate } from "react-router";
 import type { ReportNavigationEntry, ReportKind } from "@aihot/contracts/site";
+import { watchAppearance } from "../../lib/local-state";
+import { reducedMotion } from "../../lib/motion";
 import { KIND_PATH, periodGrid } from "./format";
 
 const ROW = 20;
@@ -13,8 +15,8 @@ const TAU = Math.PI * 2;
 const INTRO_MS = 700;
 const easeOutBack = (p: number) => 1 + 2.2 * (p - 1) ** 3 + 1.2 * (p - 1) ** 2;
 
-export function IssueDots({ kind, reportKey, index, className = "" }: { kind: ReportKind; reportKey: string; index: ReportNavigationEntry[]; className?: string }) {
-  const grid = useMemo(() => periodGrid(kind, reportKey, index), [kind, reportKey, index]);
+export function IssueDots({ kind, reportKey, issueNumber, index, className = "" }: { kind: ReportKind; reportKey: string; issueNumber: number; index: ReportNavigationEntry[]; className?: string }) {
+  const grid = useMemo(() => periodGrid(kind, reportKey, index, issueNumber), [kind, reportKey, index, issueNumber]);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const navigate = useNavigate();
   const rows = Math.ceil(grid.cells.length / grid.columns);
@@ -24,7 +26,7 @@ export function IssueDots({ kind, reportKey, index, className = "" }: { kind: Re
     const ctx = canvas?.getContext("2d");
     if (!canvas || !ctx) return;
     const { cells, columns } = grid;
-    const still = matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const still = reducedMotion();
     let width = 0;
     let cw = 0;
     let hovered = -1;
@@ -125,16 +127,13 @@ export function IssueDots({ kind, reportKey, index, className = "" }: { kind: Re
       readColors();
       redraw();
     };
-    const theme = new MutationObserver(recolour);
-    const scheme = matchMedia("(prefers-color-scheme: dark)");
 
     readColors();
     size();
     started = performance.now();
     redraw();
     resize.observe(canvas);
-    theme.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme", "class"] });
-    scheme.addEventListener("change", recolour);
+    const unwatch = watchAppearance((change) => change === "theme" && recolour());
     canvas.addEventListener("pointermove", onMove);
     canvas.addEventListener("pointerleave", onLeave);
     canvas.addEventListener("click", onClick);
@@ -142,8 +141,7 @@ export function IssueDots({ kind, reportKey, index, className = "" }: { kind: Re
       disposed = true;
       if (frame) cancelAnimationFrame(frame);
       resize.disconnect();
-      theme.disconnect();
-      scheme.removeEventListener("change", recolour);
+      unwatch();
       canvas.removeEventListener("pointermove", onMove);
       canvas.removeEventListener("pointerleave", onLeave);
       canvas.removeEventListener("click", onClick);

@@ -1,14 +1,13 @@
 // WeChat official accounts. Dajiala (极致了, a paid service) supplies each account's latest posts and
 // article bodies; every enabled account is checked once per source interval.
 import { sql } from "../db.ts";
-import { upsertMaterial } from "../content/materials.ts";
+import { materialIdentityForUrl, upsertMaterial } from "../content/materials.ts";
 import { enqueue, QUEUES } from "../jobs/queue.ts";
 import { queueProcessing } from "../jobs/content.ts";
 import { stripTags } from "../lib/text.ts";
 import { sanitizeBody } from "../content/sanitize.ts";
-import { identityKeyForUrl } from "../lib/url.ts";
-import { mpArticle, mpHistory, type MpArticle } from "../providers/dajiala.ts";
-import { BudgetExceededError, ProviderRejectedError } from "../providers/receipts.ts";
+import { dajialaConfigured, mpArticle, mpHistory, type MpArticle } from "../providers/dajiala.ts";
+import { failureKind } from "../providers/receipts.ts";
 
 const MAX_NEW_PER_CHECK = 8;
 /** Posts older than this on the first check of an account are history, not news. */
@@ -22,9 +21,9 @@ async function fetchBody(url: string, sourceId: string, identity: string): Promi
   try {
     return { body: await mpArticle(url, { subject: sourceId, identity }), passing: null };
   } catch (error) {
-    if (error instanceof BudgetExceededError) throw error;
-    const final = error instanceof ProviderRejectedError && !error.retryable;
-    return { body: null, passing: final ? null : String(error instanceof Error ? error.message : error).slice(0, 200) };
+    const kind = failureKind(error);
+    if (kind === "budget") throw error;
+    return { body: null, passing: kind === "refused" ? null : String(error instanceof Error ? error.message : error).slice(0, 200) };
   }
 }
 
@@ -56,9 +55,9 @@ export async function checkMpAccount(sourceId: string, reason: "schedule" | "man
       if (!p.url || !p.title || fetched >= MAX_NEW_PER_CHECK) continue;
       const publishedAt = p.post_time ? new Date(p.post_time * 1000) : null;
       if (firstCheck && publishedAt && Date.now() - publishedAt.getTime() > FIRST_CHECK_WINDOW_MS) continue;
-      // Same identity rule as every entrance: the long link without tracking parameters. A known post is
+      // Same account/post identity as every entrance, including stored historical keys. A known post is
       // skipped, unless its body failed for a passing reason: then it is tried again a few times.
-      const key = identityKeyForUrl(p.url);
+      const key = await materialIdentityForUrl(p.url);
       const [known] = key
         ? await sql<{ id: string; body_status: string; discovered_at: Date; retry: { attempts: number } | null }[]>`
             SELECT id, body_status, discovered_at, raw->'dajiala'->'bodyRetry' AS retry FROM articles WHERE identity_key = ${key} LIMIT 1`
@@ -75,7 +74,7 @@ export async function checkMpAccount(sourceId: string, reason: "schedule" | "man
       }
       // Mode 1 bodies are light HTML (paragraphs and image tags).
       const html = body?.content ? sanitizeBody(body.content, p.url) : null;
-      const text = body?.content ? stripTags(body.content.replace(/<\/p>|<br\s*\/?>/gi, "\n")).replace(/\n{3,}/g, "\n\n").trim() : null;
+      const text = body?.content ? stripTags(body.content) : null;
       const res = await upsertMaterial({
         sourceId,
         url: p.url,
@@ -98,10 +97,8 @@ export async function checkMpAccount(sourceId: string, reason: "schedule" | "man
       });
       // A body fetched again arrives as a new revision (analysed again); stop retrying it.
       if (known) await sql`UPDATE articles SET raw = raw #- '{dajiala,bodyRetry}' WHERE id = ${known.id}`;
-      if (res.created || res.revised) {
-        created += res.created ? 1 : 0;
-        await queueProcessing(res.articleId);
-      }
+      if (res.created) created += 1;
+      if (res.created || res.revised || res.processingNeeded) await queueProcessing(res.articleId);
     }
     const cursor = { ...(source.cursor ?? {}), lastCheckedAt: new Date().toISOString(), lastPostTime: posts[0]?.post_time ?? source.cursor?.lastPostTime ?? null, remainMoney: history.remainMoney };
     await sql`
@@ -112,7 +109,8 @@ export async function checkMpAccount(sourceId: string, reason: "schedule" | "man
     return { sourceId, status: "ok" as const, found: posts.length, created, reused: history.reused };
   } catch (error) {
     const message = String(error instanceof Error ? error.message : error).slice(0, 500);
-    const soft = error instanceof BudgetExceededError || (error instanceof ProviderRejectedError && error.retryable);
+    const kind = failureKind(error);
+    const soft = kind === "budget" || kind === "outage";
     await sql`
       UPDATE sources SET last_fetch_at = now(), last_error = ${message},
         fail_count = CASE WHEN ${soft} THEN fail_count ELSE fail_count + 1 END,
@@ -126,6 +124,8 @@ export async function checkMpAccount(sourceId: string, reason: "schedule" | "man
 
 /** Every enabled account is checked once per its interval (the paid list call is the cost). */
 export async function scheduleMpReconcile(now = new Date()) {
+  // Without Dajiala there is nothing to check the accounts with.
+  if (!dajialaConfigured()) return { enqueued: 0 };
   const rows = await sql<{ id: string; last: string | null; interval_minutes: number }[]>`
     SELECT id, cursor->>'lastCheckedAt' AS last, interval_minutes FROM sources WHERE kind = 'mp_account' AND enabled`;
   let enqueued = 0;

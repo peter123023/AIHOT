@@ -14,9 +14,37 @@ export function beijingTime(instant: Date | string | number): string {
   return d.toISOString().slice(11, 16);
 }
 
+/** The instant as ISO 8601 in Beijing time, to the millisecond: "2026-09-26T08:07:13.000+08:00". */
+export function beijingIso(instant: Date | string | number): string {
+  return `${new Date(new Date(instant).getTime() + OFFSET_MS).toISOString().slice(0, 23)}+08:00`;
+}
+
+/**
+ * "9月28日" of a calendar date (YYYY-MM-DD). Given `today` (YYYY-MM-DD, Beijing), a day of another year carries its
+ * year, so an archived item is not read as this year's: "2019年2月19日".
+ */
+export function monthDay(date: string, today?: string): string {
+  const year = today && date.slice(0, 4) !== today.slice(0, 4) ? `${date.slice(0, 4)}年` : "";
+  return `${year}${Number(date.slice(5, 7))}月${Number(date.slice(8, 10))}日`;
+}
+
+/** "9月29日" in Beijing time. */
+export const beijingDay = (instant: Date | string | number) => monthDay(beijingDate(instant));
+
+/** "9月29日 13:40" in Beijing time. */
+export const beijingStamp = (instant: Date | string | number) => `${beijingDay(instant)} ${beijingTime(instant)}`;
+
+/** The zone's name, for whatever takes one (a scheduler, a report's metadata, SQL `AT TIME ZONE`). */
+export const BEIJING_TIMEZONE = "Asia/Shanghai" as const;
+
 /** UTC instant of 00:00 Beijing on the given calendar day. */
 export function beijingMidnight(date: string): Date {
   return new Date(Date.parse(`${date}T00:00:00+08:00`));
+}
+
+/** UTC instant of an HH:mm Beijing time on the given calendar day. */
+export function beijingAt(date: string, time: string): Date {
+  return new Date(Date.parse(`${date}T${time}:00+08:00`));
 }
 
 export function addDays(date: string, days: number): string {
@@ -60,14 +88,16 @@ export function isoWeekRange(label: string): { start: string; end: string } | nu
   return { start: startDate, end: addDays(startDate, 6) };
 }
 
+/** First and last day (YYYY-MM-DD) of a calendar month label such as 2026-09; null for anything else. */
+export function monthRange(label: string): { start: string; end: string } | null {
+  const m = /^(\d{4})-(0[1-9]|1[0-2])$/.exec(label);
+  if (!m) return null;
+  const next = Number(m[2]) === 12 ? `${Number(m[1]) + 1}-01-01` : `${m[1]}-${String(Number(m[2]) + 1).padStart(2, "0")}-01`;
+  return { start: `${label}-01`, end: addDays(next, -1) };
+}
+
 export function isValidDate(date: string): boolean {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return false;
   const t = Date.parse(`${date}T00:00:00Z`);
   return Number.isFinite(t) && new Date(t).toISOString().slice(0, 10) === date;
-}
-
-/** Formats an instant as RFC 3339 with the +08:00 offset (used by the reset monitor API). */
-export function toBeijingIso(instant: Date | string | number): string {
-  const d = new Date(new Date(instant).getTime() + OFFSET_MS);
-  return `${d.toISOString().slice(0, 19)}+08:00`;
 }

@@ -1,9 +1,10 @@
 // SelectBench: selection-model comparison runs on the human gold set. Runs come from
 // scripts/eval-selection.ts (imported automatically) or an uploaded report; the admin compares
 // models on the same cases and browses each case.
+import type { AdminSelectBenchCases, AdminSelectBenchRuns, BeforeJson } from "@aihot/contracts/admin";
 import { randomBytes } from "node:crypto";
 import { sql } from "../db.ts";
-import { audit } from "./auth.ts";
+import { audit } from "../audit.ts";
 
 interface CaseIn {
   caseId: string;
@@ -25,12 +26,33 @@ interface ModelReport {
   cases?: CaseIn[];
 }
 
-/** Accepts { meta, models } or the older report shape keyed by model name. */
+const invalid = (message: string) => Object.assign(new Error(message), { statusCode: 400 });
+
+/** A report as scripts/eval-selection.ts writes it: { meta, models }. */
 export async function importSelectBenchRun(report: unknown, label: string, actor: string) {
-  const r = report as { meta?: Record<string, unknown>; models?: Record<string, ModelReport> } & Record<string, ModelReport>;
-  const models = (r.models ?? Object.fromEntries(Object.entries(r).filter(([k]) => k !== "meta"))) as Record<string, ModelReport>;
+  const r = report as { meta?: Record<string, unknown>; models?: Record<string, ModelReport> };
+  const models = r.models ?? {};
   const names = Object.keys(models).filter((m) => models[m]?.summary);
-  if (!names.length) throw new Error("report has no model summaries");
+  if (!names.length) throw invalid("report has no model summaries");
+  // Reject invalid evidence before writing a run; the same case may appear once per model.
+  const goldByCase = new Map<string, string>();
+  for (const m of names) {
+    const cases = models[m]!.cases;
+    if (cases === undefined) continue;
+    if (!Array.isArray(cases)) throw invalid(`${m}: cases must be an array`);
+    const ids = new Set<string>();
+    for (const c of cases) {
+      if (!c || typeof c.caseId !== "string" || !c.caseId.trim()) throw invalid(`${m}: caseId must be a non-empty string`);
+      if (ids.has(c.caseId)) throw invalid(`${m}: duplicate caseId ${c.caseId}`);
+      ids.add(c.caseId);
+      if (!["select", "reject", "either"].includes(c.gold)) throw invalid(`${m}: ${c.caseId}: invalid gold decision`);
+      const previousGold = goldByCase.get(c.caseId);
+      if (previousGold !== undefined && previousGold !== c.gold) {
+        throw invalid(`${m}: ${c.caseId}: conflicting gold decision across models`);
+      }
+      goldByCase.set(c.caseId, c.gold);
+    }
+  }
   const meta = r.meta ?? {};
   const id = `sb-${new Date().toISOString().slice(0, 10).replaceAll("-", "")}-${randomBytes(3).toString("hex")}`;
   const summary = Object.fromEntries(names.map((m) => [m, { ...models[m]!.summary, sweep: models[m]!.sweep ?? [] }]));
@@ -65,8 +87,8 @@ export async function importSelectBenchRun(report: unknown, label: string, actor
   return { id };
 }
 
-export async function listSelectBenchRuns() {
-  return sql`
+export async function listSelectBenchRuns(): Promise<BeforeJson<AdminSelectBenchRuns["runs"]>> {
+  return sql<BeforeJson<AdminSelectBenchRuns["runs"][number]>[]>`
     SELECT r.id, r.label, r.split, r.sample_size, r.prompt_version, r.models,
            (SELECT coalesce(jsonb_object_agg(key, value - 'sweep'), '{}'::jsonb) FROM jsonb_each(r.summary)) AS summary,
            r.created_at, r.imported_by,
@@ -74,12 +96,13 @@ export async function listSelectBenchRuns() {
     FROM selectbench_runs r ORDER BY r.created_at DESC LIMIT 100`;
 }
 
-export async function selectBenchRun(id: string, f: { model?: string; outcome?: string; stratum?: string; disagree?: boolean }) {
-  const [run] = await sql`SELECT * FROM selectbench_runs WHERE id = ${id}`;
+export async function selectBenchRun(id: string, f: { model?: string; outcome?: string; stratum?: string; disagree?: boolean }): Promise<BeforeJson<AdminSelectBenchCases> | null> {
+  const [run] = await sql<BeforeJson<AdminSelectBenchCases["run"]>[]>`SELECT * FROM selectbench_runs WHERE id = ${id}`;
   if (!run) return null;
   const outcome = f.outcome ?? null;
   // One row per case with every model's decision, so disagreements are visible side by side.
-  const rows = await sql`
+  const [rows, strata] = await Promise.all([
+    sql<AdminSelectBenchCases["rows"]>`
     SELECT case_id, min(title) AS title, min(stratum) AS stratum, min(gold) AS gold,
            jsonb_object_agg(model, jsonb_build_object('decision', decision, 'score', score, 'relevance', relevance, 'category', category, 'reason', reason, 'error', error, 'receiptId', receipt_id)) AS by_model
     FROM selectbench_results WHERE run_id = ${id} AND (${f.stratum ?? null}::text IS NULL OR stratum = ${f.stratum ?? null})
@@ -94,7 +117,8 @@ export async function selectBenchRun(id: string, f: { model?: string; outcome?: 
         WHEN 'error' THEN decision IS NULL
         ELSE true END))
       AND (${!!f.disagree} IS FALSE OR count(DISTINCT decision) > 1)
-    ORDER BY min(stratum), case_id LIMIT 400`;
-  const strata = await sql`SELECT stratum, count(DISTINCT case_id)::int AS n FROM selectbench_results WHERE run_id = ${id} GROUP BY 1 ORDER BY 2 DESC`;
+    ORDER BY min(stratum), case_id LIMIT 400`,
+    sql<AdminSelectBenchCases["strata"]>`SELECT stratum, count(DISTINCT case_id)::int AS n FROM selectbench_results WHERE run_id = ${id} GROUP BY 1 ORDER BY 2 DESC`,
+  ]);
   return { run, rows, strata };
 }

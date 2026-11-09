@@ -1,50 +1,33 @@
-import { SITE } from "@aihot/industry/site";
 import { useState } from "react";
 import { Link } from "react-router";
 import type { Route } from "./+types/models";
+import type { AdminModels } from "@aihot/contracts/admin";
+import { SITE } from "@aihot/site";
 import { adminGet } from "../../lib/admin.server";
 import { useAdminAction } from "../../features/admin/action";
 import { bj, money, num } from "../../features/admin/format";
 import { AdminPage, Badge, Button, Card, DataTable, Empty, Field, FilterChips, ReasonDialog, Select } from "../../features/admin/ui";
 
-interface Usage {
-  purpose: string;
-  model: string | null;
-  promptVersion: string | null;
-  calls: number;
-  ok: number;
-  failed: number;
-  unknown: number;
-  p50: number | null;
-  p95: number | null;
-  tokensIn: number;
-  tokensOut: number;
-  actualCost: number | null;
-  currency: string | null;
-  estimate: { amount: number; currency: string } | null;
-}
 
-interface Models {
-  days: number;
-  capabilities: Array<{ key: string; label: string; env: string; defaultModel: string; vision: boolean; current: { model: string; source: "admin" | "env" | "default" }; usage: Usage[] }>;
-  choices: Array<{ key: string; service: string; vision: boolean }>;
-  history: Array<{ at: string; actor: string; subject: string; reason: string | null; before: { model: string; source: string } | null; after: { model: string; source: string } | null }>;
-  benches: Array<{ id: string; label: string; sample_size: number; prompt_version: string | null; models: string[]; created_at: string }>;
-}
 
 export async function loader({ request }: Route.LoaderArgs) {
   const days = new URL(request.url).searchParams.get("days") ?? "7";
-  return adminGet<Models>(request, `/api/admin/models?days=${encodeURIComponent(days)}`);
+  return adminGet<AdminModels>(request, `/api/admin/models?days=${encodeURIComponent(days)}`);
 }
 
 export const meta: Route.MetaFunction = () => [{ title: `模型与评测 · ${SITE.name} 后台` }];
 
 const SOURCE_LABEL = { admin: "后台切换", env: "环境变量", default: "代码默认" } as const;
+
+/** A cost the provider did not report and no price covers. */
+function Unpriced() {
+  return <span className="whitespace-nowrap text-ink-4" title="服务商没有返回费用，按 token 数和你的模型单价自己估算">未定价</span>;
+}
 const secs = (ms: number | null) => (ms == null ? "—" : ms >= 10_000 ? `${Math.round(ms / 1000)} s` : `${(ms / 1000).toFixed(1)} s`);
 
 export default function ModelsAdmin({ loaderData: m }: Route.ComponentProps) {
   const { run, pending } = useAdminAction();
-  const [target, setTarget] = useState<Models["capabilities"][number] | null>(null);
+  const [target, setTarget] = useState<AdminModels["capabilities"][number] | null>(null);
   const [choice, setChoice] = useState<string>("");
   const labelOf = (key: string) => m.capabilities.find((c) => `capability:${c.key}` === key)?.label ?? key;
 
@@ -54,7 +37,7 @@ export default function ModelsAdmin({ loaderData: m }: Route.ComponentProps) {
       subtitle="每项能力当前用哪个模型、来自哪里（后台切换 > 环境变量 > 代码默认），以及近期的成功率、耗时与费用。切换只影响之后的新任务，已有结果不重算；换精选模型前先看 SelectBench 同批对比。"
       actions={<FilterChips param="days" options={[{ value: "1", label: "24 小时" }, { value: "", label: "7 天" }, { value: "30", label: "30 天" }]} />}
     >
-      <div className="grid gap-5">
+      <div className="grid grid-cols-1 gap-5">
         {m.capabilities.map((c) => {
           const total = c.usage.reduce((a, u) => a + u.calls, 0);
           return (
@@ -63,8 +46,15 @@ export default function ModelsAdmin({ loaderData: m }: Route.ComponentProps) {
               title={
                 <span className="inline-flex flex-wrap items-center gap-2">
                   {c.label}
-                  <span className="font-mono text-[12px] font-normal text-ink-3">{c.current.model}</span>
+                  <span className="font-mono text-[12px] font-normal text-ink-3 [overflow-wrap:anywhere]">{c.current.model}</span>
                   <Badge tone={c.current.source === "admin" ? "accent" : "muted"}>{SOURCE_LABEL[c.current.source]}</Badge>
+                  {c.current.invalid && <Badge tone="bad">配置的 {c.current.invalid} 不存在，未生效</Badge>}
+                  {c.fallback && <span className="text-xs font-normal text-ink-3">
+                    备用 {c.fallback.model} · {c.fallback.primaryPaused
+                      ? c.fallback.backupPaused ? "主备均暂停，等待恢复" : "正在接续"
+                      : c.fallback.backupPaused ? "暂不可用" : "就绪"}
+                    {c.fallback.nextProbeAt && ` · ${bj(c.fallback.nextProbeAt)} 后随新请求复查主模型`}
+                  </span>}
                 </span>
               }
               right={
@@ -111,7 +101,7 @@ export default function ModelsAdmin({ loaderData: m }: Route.ComponentProps) {
                         ) : u.estimate ? (
                           <span title="按用量 × 单价推算">≈ {money(u.estimate.amount)}{u.estimate.currency !== "CNY" ? ` ${u.estimate.currency}` : ""}</span>
                         ) : (
-                          <span className="whitespace-nowrap text-ink-4" title="服务商没有返回费用，按 token 数和你的模型单价自己估算">未定价</span>
+                          <Unpriced />
                         ),
                     },
                   ]}
@@ -124,7 +114,7 @@ export default function ModelsAdmin({ loaderData: m }: Route.ComponentProps) {
         })}
       </div>
 
-      <div className="mt-5 grid gap-5 xl:grid-cols-2">
+      <div className="mt-5 grid grid-cols-1 gap-5 xl:grid-cols-2">
         <Card title="切换记录" pad={false}>
           {m.history.length ? (
             <DataTable
@@ -176,7 +166,7 @@ export default function ModelsAdmin({ loaderData: m }: Route.ComponentProps) {
         <Field label="模型">
           <Select value={choice} onChange={(e) => setChoice(e.target.value)}>
             {m.choices
-              .filter((x) => x.vision === !!target?.vision)
+              .filter((x) => !target?.vision || x.vision)
               .map((x) => (
                 <option key={x.key} value={x.key}>
                   {x.key}（{x.service}）

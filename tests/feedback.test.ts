@@ -1,16 +1,27 @@
 // Feedback reaches the internal Feishu chat with its screenshot even when Feishu fails at first: a
 // failed upload or send is tried again, only the Feishu image key is kept, a screenshot that cannot be
-// uploaded for a day is dropped (the text still goes), and imported feedback is never forwarded again.
-import { tag } from "./setup.ts";
+// uploaded for a day, or that Feishu refuses outright, is dropped (the text still goes), screenshots left
+// behind are removed after a week, and imported feedback is never forwarded again. Without the chat a
+// screenshot is the only copy: it stays.
+// Handling records what each feedback is (a bug, a suggestion, a question or other), and suggestions that
+// name the same idea add up by sender, so the admin sees what readers ask for most. The pool lists every
+// idea: handling names a suggestion after the names in it, and one missing would get a second name.
+// Before a report is pushed a cheap model reads it: one with nothing in it is marked spam and not pushed,
+// and a model that cannot answer never holds a report back.
+import { pointModels, tag } from "./setup.ts";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
+import sharp from "sharp";
+import { listFeedback, updateFeedback } from "@aihot/backend/admin/feedback";
+import { Conflict } from "@aihot/backend/audit";
 import { config } from "@aihot/backend/config";
 import { closeDb, sql } from "@aihot/backend/db";
 import { forwardFeedbackToFeishu } from "@aihot/backend/notify/feishu";
 import { forwardPendingFeedback, submitFeedback } from "@aihot/backend/operations/feedback";
+import { dailyRetention } from "@aihot/backend/operations/retention";
 
 const T = tag();
 config.dataDir = mkdtempSync(path.join(tmpdir(), "aihot-feedback-"));
@@ -19,13 +30,24 @@ process.env.FEISHU_APP_SECRET = "test-secret";
 process.env.FEISHU_INTERNAL_CHAT_ID = "oc_test";
 
 // Feishu's message app, answered here: uploads and sends fail while the switches say so.
-const feishu = { uploadFails: false, sendFails: false, sent: [] as Array<{ title: string; content: unknown[][] }> };
+const feishu = { uploadFails: false, uploadRefused: false, uploads: 0, sendFails: false, sent: [] as Array<{ title: string; content: unknown[][] }> };
+const MODEL_URL = "https://model.test/v1";
+const model = { noise: false, fails: false, calls: 0 };
 const realFetch = globalThis.fetch;
 globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
   const url = String(input instanceof Request ? input.url : input);
+  if (url.startsWith(MODEL_URL)) {
+    model.calls += 1;
+    if (model.fails) return new Response("down", { status: 500 });
+    return Response.json({ choices: [{ message: { content: JSON.stringify({ noise: model.noise }) }, finish_reason: "stop" }], usage: { prompt_tokens: 1, completion_tokens: 1 } });
+  }
   if (!url.startsWith("https://open.feishu.cn/")) return realFetch(input, init);
   if (url.endsWith("/auth/v3/tenant_access_token/internal")) return Response.json({ code: 0, tenant_access_token: "t", expire: 7200 });
-  if (url.endsWith("/im/v1/images")) return Response.json(feishu.uploadFails ? { code: 99, msg: "upload broken" } : { code: 0, data: { image_key: `img_${T}` } });
+  if (url.endsWith("/im/v1/images")) {
+    feishu.uploads += 1;
+    if (feishu.uploadRefused) return Response.json({ code: 234011, msg: "Can't regonise the image format." }, { status: 400 });
+    return Response.json(feishu.uploadFails ? { code: 99, msg: "upload broken" } : { code: 0, data: { image_key: `img_${T}` } });
+  }
   if (url.includes("/im/v1/messages")) {
     if (feishu.sendFails) return Response.json({ code: 99, msg: "send broken" });
     const content = JSON.parse(JSON.parse(String(init?.body)).content).zh_cn;
@@ -40,13 +62,12 @@ after(async () => {
   await closeDb();
 });
 
-const PNG = Buffer.from("89504e470d0a1a0a0000000d4948445200000001000000010806000000", "hex");
 let n = 0;
 async function submit(): Promise<{ id: number; file: string }> {
   n += 1;
   // Submitted while forwarding is off, so the test drives every attempt itself.
   delete process.env.FEISHU_INTERNAL_ENABLED;
-  const { id } = await submitFeedback({ content: `反馈 ${T}-${n}`, screenshot: { mime: "image/png", data: Buffer.concat([PNG, Buffer.from(`${T}-${n}`)]) }, ip: `203.0.113.${n}`, userAgent: "test" });
+  const { id } = await submitFeedback({ content: `反馈 ${T}-${n}`, screenshot: { mime: "image/png", data: await sharp({ create: { width: 4, height: 4, channels: 3, background: { r: n, g: 80, b: 120 } } }).png().toBuffer() }, ip: `203.0.113.${n}`, userAgent: "test" });
   process.env.FEISHU_INTERNAL_ENABLED = "true";
   const [row] = await sql<{ screenshot_key: string }[]>`SELECT screenshot_key FROM feedback WHERE id = ${id}`;
   return { id, file: path.join(config.dataDir, "feedback-screenshots", row!.screenshot_key.slice("local:".length)) };
@@ -96,10 +117,199 @@ test("a screenshot that cannot be uploaded for a day is dropped, and the text st
   assert.ok(JSON.stringify(sentFor(id)?.content).includes("截图未能上传"), "the chat is told the screenshot is missing");
 });
 
+test("a picture Feishu refuses is dropped at once, and the text still goes", async () => {
+  const { id, file } = await submit();
+  feishu.uploadRefused = true;
+  const uploads = feishu.uploads;
+  assert.equal(await forwardFeedbackToFeishu(id), "sent");
+  feishu.uploadRefused = false;
+  assert.equal(feishu.uploads, uploads + 1, "offered once, not again on every sweep");
+  assert.deepEqual({ ...(await state(id)) }, { forwarded: true, forward_error: null, screenshot_key: "gone:upload" });
+  assert.ok(!existsSync(file));
+});
+
+test("screenshots left behind are removed after a week, whether or not forwarding ran; without the chat they stay", async () => {
+  const dir = path.join(config.dataDir, "feedback-screenshots");
+  mkdirSync(dir, { recursive: true });
+  const stale = path.join(dir, `stale-${T}.png`);
+  const recent = path.join(dir, `recent-${T}.png`);
+  writeFileSync(stale, "x");
+  writeFileSync(recent, "x");
+  const nineDaysAgo = new Date(Date.now() - 9 * 86400_000);
+  utimesSync(stale, nineDaysAgo, nineDaysAgo);
+  process.env.FEISHU_INTERNAL_ENABLED = "false";
+  assert.equal((await dailyRetention()).deletedScreenshots, 0);
+  assert.ok(existsSync(stale), "a screenshot nobody forwards is the only copy");
+  process.env.FEISHU_INTERNAL_ENABLED = "true";
+  const result = await dailyRetention();
+  assert.ok(result.deletedScreenshots >= 1);
+  assert.ok(!existsSync(stale));
+  assert.ok(existsSync(recent), "a screenshot still waiting for forwarding stays");
+});
+
 test("imported feedback that was never forwarded is not sent now", async () => {
   const [row] = await sql<{ id: number }[]>`
-    INSERT INTO feedback (content, source_hash, created_at) VALUES (${`旧反馈 ${T}`}, ${`legacy:${T}`}, now() - interval '10 minutes') RETURNING id`;
+    INSERT INTO feedback (content, source_hash, created_at) VALUES (${`旧反馈 ${T}`}, ${`imported:${T}`}, now() - interval '10 minutes') RETURNING id`;
   await forwardPendingFeedback();
   assert.equal((await state(row!.id)).forwarded, false);
   assert.equal(sentFor(row!.id), undefined);
+});
+
+test("a browser retry creates one feedback and forwards one notification", async () => {
+  process.env.FEISHU_INTERNAL_ENABLED = "true";
+  const input = { ip: "203.0.113.190", userAgent: "Firefox", content: `重试的安全报告 ${T}: <script>alert(1)</script>` };
+  const results = await Promise.all(Array.from({ length: 4 }, () => submitFeedback(input)));
+  assert.equal(new Set(results.map(r => r.id)).size, 1);
+  const id = results[0]!.id;
+  for (let i = 0; i < 100 && !(await state(id)).forwarded; i++) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.ok((await state(id)).forwarded);
+  assert.equal(feishu.sent.filter(m => m.title === `反馈 #${id}`).length, 1);
+  assert.ok(JSON.stringify(sentFor(id)?.content).includes(input.content));
+});
+
+test("a report the model reads as empty is marked spam and not pushed; a real one, or a model that cannot answer, still goes out", async () => {
+  pointModels(MODEL_URL, ["qwen3.7-flash"]);
+  config.modelCallsEnabled = true;
+  try {
+    const pending = async (content: string, screenshot = false) => {
+      delete process.env.FEISHU_INTERNAL_ENABLED;
+      const { id } = await submitFeedback({ content: `${content} ${T}`, ip: `198.51.100.${100 + ++n}`, userAgent: "Firefox", ...(screenshot ? { screenshot: { mime: "image/png", data: await sharp({ create: { width: 4, height: 4, channels: 3, background: { r: n, g: 1, b: 1 } } }).png().toBuffer() } } : {}) });
+      process.env.FEISHU_INTERNAL_ENABLED = "true";
+      await olderBy(id, "10 minutes");
+      return id;
+    };
+    const record = async (id: number) => (await sql<{ status: string; kind: string | null; note: string | null; forward_error: string | null }[]>`SELECT status, kind, note, forward_error FROM feedback WHERE id = ${id}`)[0]!;
+
+    model.noise = true;
+    const empty = await pending("111111");
+    await forwardPendingFeedback();
+    assert.equal(sentFor(empty), undefined);
+    const dropped = await record(empty);
+    assert.deepEqual([dropped.status, dropped.kind, dropped.forward_error], ["spam", "other", null]);
+    assert.match(dropped.note!, /模型/, "the record says why nobody was told");
+    const [logged] = await sql<{ actor: string }[]>`SELECT actor FROM audit_log WHERE subject = ${`feedback:${empty}`} AND action = 'feedback.update'`;
+    assert.equal(logged?.actor, "feedback-auto");
+    const calls = model.calls;
+    await forwardPendingFeedback();
+    assert.equal(model.calls, calls, "settled: not read again on the next sweep");
+
+    const handled = await pending("已经有人处理了的反馈");
+    await sql`UPDATE feedback SET status = 'triaged' WHERE id = ${handled}`;
+    await forwardPendingFeedback();
+    assert.ok(sentFor(handled), "only a report nobody has looked at yet can be dropped");
+    assert.equal((await record(handled)).status, "triaged");
+
+    model.noise = false;
+    const real = await pending("搜索打不开");
+    await forwardPendingFeedback();
+    assert.ok(sentFor(real));
+    assert.equal((await record(real)).status, "new");
+
+    model.fails = true;
+    const down = await pending("模型挂了的时候提的反馈");
+    await forwardPendingFeedback();
+    assert.ok(sentFor(down), "a model that cannot answer does not hold the report back");
+    assert.equal((await record(down)).status, "new");
+    model.fails = false;
+
+    const asked: string[] = [];
+    const before = globalThis.fetch;
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).startsWith(MODEL_URL)) asked.push(JSON.parse(String(init?.body)).messages.at(-1).content);
+      return before(input, init);
+    }) as typeof fetch;
+    const shot = await pending("这里不对", true);
+    await forwardPendingFeedback();
+    globalThis.fetch = before;
+    assert.ok(sentFor(shot));
+    assert.ok(asked.some((text) => text.includes("这里不对") && text.includes('"has_screenshot":true')), "the model knows a picture came with the words");
+  } finally {
+    config.modelCallsEnabled = false;
+  }
+});
+
+/** Handles one feedback as the admin would: against the version it was read at. */
+async function handle(id: number, change: { status?: string; kind?: string | null; idea?: string | null; note?: string | null }) {
+  const [row] = (await listFeedback({ id })).rows;
+  return updateFeedback(id, { ...change, version: new Date(row!.updated_at).toISOString() }, "test");
+}
+const ask = (content: string, ip: string) => {
+  delete process.env.FEISHU_INTERNAL_ENABLED;
+  return submitFeedback({ content: `${content} ${T}`, ip, userAgent: "Firefox" });
+};
+
+test("handling records what each feedback is, and suggestions for the same idea add up by sender", async () => {
+  const idea = `GitHub 热点项目榜 ${T}`;
+  const first = await ask("想要一个 GitHub 热门项目榜", "198.51.100.11");
+  const second = await ask("能不能加 GitHub trending", "198.51.100.12");
+  const again = await ask("还是想要 GitHub 热点", "198.51.100.11");
+  const spam = await ask("GitHub 热点 GitHub 热点", "198.51.100.13");
+  const english = await ask("加一个英文版", "198.51.100.14");
+  await handle(first.id, { kind: "suggestion", idea, status: "triaged" });
+  await handle(second.id, { kind: "suggestion", idea: `  ${idea} `, status: "triaged" });
+  await handle(again.id, { kind: "suggestion", idea, status: "triaged" });
+  await handle(spam.id, { kind: "suggestion", idea, status: "spam" });
+  await handle(english.id, { kind: "suggestion", idea: `英文版 ${T}`, status: "triaged" });
+
+  const pool = (await listFeedback({ kind: "suggestion" })).ideas.filter((i) => i.idea.endsWith(T));
+  assert.deepEqual(pool.map((i) => [i.idea, i.people]), [[idea, 2], [`英文版 ${T}`, 1]],
+    "the sender who asked twice counts once, spam does not count, the most asked comes first");
+  const listed = await listFeedback({ kind: "suggestion", idea });
+  assert.deepEqual(listed.rows.map((r) => r.id).sort(), [first.id, second.id, again.id, spam.id].sort());
+  assert.ok(listed.rows.every((r) => r.kind === "suggestion" && r.idea === idea), "the name is kept without surrounding spaces");
+  assert.ok((listed.kinds.suggestion ?? 0) >= 5);
+  const [audit] = await sql<{ before: { kind: string | null }; after: { kind: string; idea: string } }[]>`
+    SELECT before, "after" FROM audit_log WHERE subject = ${`feedback:${first.id}`} ORDER BY id DESC LIMIT 1`;
+  assert.deepEqual([audit!.before.kind, audit!.after.kind, audit!.after.idea], [null, "suggestion", idea]);
+});
+
+test("the pool lists every idea, however many there are", async () => {
+  const named = Array.from({ length: 201 }, (_, i) => `建议池第 ${i + 1} 项 ${T}`);
+  await sql`INSERT INTO feedback ${sql(named.map((idea, i) => ({ content: `想要${idea}`, source_hash: `pool:${T}:${i}`, status: "triaged", kind: "suggestion", idea })))}`;
+  const pool = new Set((await listFeedback({ kind: "suggestion" })).ideas.map((i) => i.idea));
+  assert.deepEqual(named.filter((idea) => !pool.has(idea)), []);
+});
+
+test("an unknown kind, an idea outside a suggestion and a stale version are refused; reclassifying leaves the pool", async () => {
+  const { id } = await ask("为什么模型榜上没有千问了", "198.51.100.21");
+  await assert.rejects(handle(id, { kind: "praise" }), /unknown kind/);
+  await assert.rejects(handle(id, { kind: "question", idea: "千问上榜" }), /只有建议/);
+  await assert.rejects(handle(id, { kind: "suggestion", idea: "名".repeat(41) }), /40/);
+  const stale = new Date((await listFeedback({ id })).rows[0]!.updated_at).toISOString();
+  await handle(id, { kind: "suggestion", idea: `千问上榜 ${T}` });
+  await assert.rejects(updateFeedback(id, { kind: "question", version: stale }, "test"), (e) => e instanceof Conflict);
+  await handle(id, { kind: "question" });
+  const [row] = (await listFeedback({ id })).rows;
+  assert.deepEqual([row!.kind, row!.idea], ["question", null], "a feedback that is no longer a suggestion leaves the pool");
+  assert.ok(!(await listFeedback({ kind: "suggestion" })).ideas.some((i) => i.idea === `千问上榜 ${T}`));
+});
+
+test("the admin page filters by kind and idea and edits both through the API", async () => {
+  const { buildApp } = await import("../apps/api/src/app.ts");
+  const { registerAdmin } = await import("../apps/api/src/routes/admin.ts");
+  const { ADMIN } = await import("@aihot/site");
+  const { passwordLogin, SESSION_COOKIE } = await import("@aihot/backend/admin/auth");
+  const app = await buildApp();
+  // The engine's admin API, which a site without admin pages does not mount.
+  if (!ADMIN) registerAdmin(app);
+  const originalPassword = config.adminPassword;
+  config.adminPassword = "feedback-handling-test-password";
+  try {
+    const { token } = await passwordLogin(config.adminPassword, "/admin", "test");
+    const cookie = `${SESSION_COOKIE}=${token}`;
+    const headers = { cookie, "x-csrf-token": (await app.inject({ method: "GET", url: "/api/admin/me", headers: { cookie } })).json().csrf };
+    const idea = `动态下面能评论 ${T}`;
+    const { id } = await ask("想在每条动态下面评论", "198.51.100.31");
+    const version = new Date((await listFeedback({ id })).rows[0]!.updated_at).toISOString();
+    const edited = await app.inject({ method: "PATCH", url: `/api/admin/feedback/${id}`, headers, payload: { kind: "suggestion", idea, version } });
+    assert.equal(edited.statusCode, 200, edited.body);
+    const listed = await app.inject({ method: "GET", url: `/api/admin/feedback?kind=suggestion&idea=${encodeURIComponent(idea)}`, headers: { cookie } });
+    assert.deepEqual(listed.json().rows.map((r: { id: number }) => r.id), [id]);
+    assert.deepEqual(listed.json().ideas.find((i: { idea: string }) => i.idea === idea)?.people, 1);
+    const bugs = await app.inject({ method: "GET", url: "/api/admin/feedback?kind=bug", headers: { cookie } });
+    assert.ok(!bugs.json().rows.some((r: { id: number }) => r.id === id));
+  } finally {
+    config.adminPassword = originalPassword;
+    await app.close();
+  }
 });
